@@ -29,7 +29,7 @@ from .core import (
     parse_lsf_file,
 )
 
-TITLE = "Haisou Shoujo Series CG & Gareki Viewer & Extractor Ver1.0（ 由ユイ可愛ね制作 GPT编写 本软件免费使用，开源于Github，严禁倒卖牟利！）"
+TITLE = "Haison Shoujo Series CG & Gareki Viewer & Extractor Ver1.0（ 由ユイ可愛ね制作 GPT编写 本软件免费使用，开源于Github，严禁倒卖牟利！）"
 SUPPORTED_SERIES_TEXT = """目前支持：
 廃村少女 ～妖し惑ひの籠の郷～ (原版）
 廃村少女 外伝 ～嬌絡夢現～
