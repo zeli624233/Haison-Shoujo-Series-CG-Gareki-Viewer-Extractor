@@ -28,7 +28,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='HaisouShoujoViewerExtractor',
+    name='HaisonShoujoViewerExtractor',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
