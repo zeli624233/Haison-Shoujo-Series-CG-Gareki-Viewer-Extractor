@@ -396,7 +396,8 @@ class LSFTab(BaseTab):
         self.scene_combo.pack(fill="x", padx=8)
         self.scene_combo.bind("<<ComboboxSelected>>", lambda e: self._load_selected_scene())
 
-        ttk.Label(options, text="衣服或者其他时间端").pack(anchor="w", padx=8, pady=(8, 2))
+        self.body_label = ttk.Label(options, text="衣服或者其他时间端")
+        self.body_label.pack(anchor="w", padx=8, pady=(8, 2))
         self.body_combo = ttk.Combobox(options, textvariable=self.body_var, state="readonly", width=48)
         self.body_combo.pack(fill="x", padx=8)
         self.body_combo.bind("<<ComboboxSelected>>", lambda e: self._on_body_selected())
@@ -427,7 +428,8 @@ class LSFTab(BaseTab):
         for i, (_group_name, options) in enumerate(expression_groups, start=1):
             var = tk.StringVar()
             self.expression_vars.append(var)
-            ttk.Label(self.group_controls_frame, text=_group_name or f"表情{i}").pack(anchor="w", padx=8, pady=(8, 2))
+            display_name = str(_group_name or "").strip() or f"表情{i}"
+            ttk.Label(self.group_controls_frame, text=display_name).pack(anchor="w", padx=8, pady=(8, 2))
             combo = ttk.Combobox(self.group_controls_frame, textvariable=var, state="readonly", width=48)
             combo.pack(fill="x", padx=8)
             combo["values"] = [x.label for x in options]
@@ -441,7 +443,8 @@ class LSFTab(BaseTab):
         for i, (_group_name, options) in enumerate(blush_groups, start=1):
             var = tk.StringVar()
             self.blush_vars.append(var)
-            ttk.Label(self.group_controls_frame, text=_group_name or f"红晕{i}").pack(anchor="w", padx=8, pady=(8, 2))
+            display_name = str(_group_name or "").strip() or f"红晕{i}"
+            ttk.Label(self.group_controls_frame, text=display_name).pack(anchor="w", padx=8, pady=(8, 2))
             combo = ttk.Combobox(self.group_controls_frame, textvariable=var, state="readonly", width=48)
             combo.pack(fill="x", padx=8)
             combo["values"] = [x.label for x in options]
@@ -452,7 +455,8 @@ class LSFTab(BaseTab):
         for i, (_group_name, options) in enumerate(special_groups, start=1):
             var = tk.StringVar()
             self.special_vars.append(var)
-            ttk.Label(self.group_controls_frame, text=_group_name or f"特殊{i}").pack(anchor="w", padx=8, pady=(8, 2))
+            display_name = str(_group_name or "").strip() or f"特殊{i}"
+            ttk.Label(self.group_controls_frame, text=display_name).pack(anchor="w", padx=8, pady=(8, 2))
             combo = ttk.Combobox(self.group_controls_frame, textvariable=var, state="readonly", width=48)
             combo.pack(fill="x", padx=8)
             combo["values"] = [x.label for x in options]
@@ -608,6 +612,30 @@ class LSFTab(BaseTab):
         except Exception as exc:
             messagebox.showerror("加载失败", str(exc))
 
+    def _has_real_body_options(self) -> bool:
+        if not self.scene:
+            return False
+        return any(len(opt.records) > 0 and not opt.key.startswith("__none") for opt in self.scene.body_options)
+
+    def _apply_body_visibility(self) -> None:
+        # 没有真正“衣服/时间端”选项时，不显示这个空下拉框，避免遮住下面的表情选项。
+        # 注意：Tkinter 的 pack(before=...) 要求 before 目标当前已经由 pack 管理；
+        # 之前在重新显示 body_label 时把 before 指向已被 pack_forget 的 body_combo，
+        # 会触发 “isn't packed” 错误。这里统一以一直存在的 group_controls_frame
+        # 作为锚点，并且 pack_forget 前先确认控件确实由 pack 管理。
+        if self._has_real_body_options():
+            if not self.body_label.winfo_manager():
+                self.body_label.pack(anchor="w", padx=8, pady=(8, 2), before=self.group_controls_frame)
+            if not self.body_combo.winfo_manager():
+                self.body_combo.pack(fill="x", padx=8, before=self.group_controls_frame)
+            self.body_combo.state(["!disabled", "readonly"])
+        else:
+            self.body_combo.state(["disabled"])
+            if self.body_combo.winfo_manager() == "pack":
+                self.body_combo.pack_forget()
+            if self.body_label.winfo_manager() == "pack":
+                self.body_label.pack_forget()
+
     def _apply_group_to_combo(self, combo: ttk.Combobox, var: tk.StringVar, groups, idx: int, none_label: str) -> None:
         if idx < len(groups):
             _group_name, options = groups[idx]
@@ -636,6 +664,7 @@ class LSFTab(BaseTab):
                 self.body_var.set(self.scene.body_options[1].label)
             else:
                 self.body_var.set(self.scene.body_options[0].label if self.scene.body_options else "")
+            self._apply_body_visibility()
 
             self._rebuild_group_controls(self.scene.expression_groups, self.scene.blush_groups, self.scene.special_groups)
 
@@ -809,7 +838,8 @@ class LSFTab(BaseTab):
 
     def _lsf_targets_for_scene(self, scene: LSFScene) -> list[tuple[str, str, list[str]]]:
         targets: list[tuple[str, str, list[str]]] = []
-        targets.append(("body", "衣服或者其他时间端", [x.label for x in scene.body_options]))
+        if any(len(opt.records) > 0 and not opt.key.startswith("__none") for opt in scene.body_options):
+            targets.append(("body", "衣服或者其他时间端", [x.label for x in scene.body_options]))
         for i, (_name, options) in enumerate(scene.expression_groups, start=1):
             targets.append((f"expression_{i}", f"表情{i}", [x.label for x in options]))
         for i, (_name, options) in enumerate(scene.blush_groups, start=1):
@@ -1348,7 +1378,8 @@ class JSONTab(BaseTab):
         self.scene_combo.pack(fill="x", padx=8)
         self.scene_combo.bind("<<ComboboxSelected>>", lambda e: self._load_selected_scene())
 
-        ttk.Label(options, text="衣服或者其他时间端").pack(anchor="w", padx=8, pady=(8, 2))
+        self.body_label = ttk.Label(options, text="衣服或者其他时间端")
+        self.body_label.pack(anchor="w", padx=8, pady=(8, 2))
         self.body_combo = ttk.Combobox(options, textvariable=self.body_var, state="readonly", width=48)
         self.body_combo.pack(fill="x", padx=8)
         self.body_combo.bind("<<ComboboxSelected>>", lambda e: self._on_body_selected())

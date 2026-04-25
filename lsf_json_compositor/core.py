@@ -668,26 +668,40 @@ def _build_single_base_face_overlay_scene(
     project: LSFProject,
     slots: dict[int, dict[int, list[LSFRecord]]],
     canvas_area: int,
-) -> tuple[list[LSFRecord], list[LSFOption], list[str]]:
-    """Build body options for the single-base + face-overlay EV pattern.
+) -> tuple[
+    list[LSFRecord],
+    list[LSFOption],
+    list[tuple[str, list[LSFOption]]],
+    list[tuple[str, list[LSFOption]]],
+    list[tuple[str, list[LSFOption]]],
+    list[str],
+]:
+    """Build controls for the single-base + face-overlay EV pattern.
 
-    The first option is intentionally empty, so the GUI opens with only the fixed
-    full CG. Face overlays remain selectable, but are no longer applied by default.
+    Files such as EV_B07 contain one full base CG in slot00 plus small face
+    difference layers in slot0A/slot0B.  Earlier versions put those small layers
+    into the body/time combobox, so the UI looked like it had no expression
+    controls.  Keep the full CG as the fixed base image and expose slot0A as
+    表情, slot0B as 红晕/脸部附加差分, and any other non-zero slots as 特殊.
     """
     fixed_records: list[LSFRecord] = []
-    body_options: list[LSFOption] = [LSFOption("__none__", "原图（不叠加脸部差分）", [])]
-    notes: list[str] = ["识别为单张 EV 底图 + 脸部差分/遮罩，默认叠加第一张可见差分；仍可手动选原图。"]
+    body_options: list[LSFOption] = [LSFOption("__none__", "原图", [])]
+    expression_groups: list[tuple[str, list[LSFOption]]] = []
+    blush_groups: list[tuple[str, list[LSFOption]]] = []
+    special_groups: list[tuple[str, list[LSFOption]]] = []
+    notes: list[str] = ["识别为单张 EV 底图 + 脸部差分，已将 slot0A/slot0B 拆成表情/红晕选项。"]
 
     for recs in slots.get(0, {}).values():
         for r in sorted(recs, key=lambda x: x.index):
             if _mid_code(r) == 0 and r.area >= canvas_area * 0.80:
                 fixed_records.append(r)
 
-    seen_options: set[tuple] = set()
-    for slot in sorted(s for s in slots.keys() if s != 0):
-        for variant, recs in sorted(slots[slot].items()):
-            # Do not expose the engine helper masks. They are the usual source of
-            # the opaque white face rectangles.
+    def build_slot_options(slot: int, none_label: str, key_prefix: str) -> list[LSFOption]:
+        options: list[LSFOption] = [LSFOption("__none__", none_label, [])]
+        seen_options: set[tuple] = set()
+        for variant, recs in sorted(slots.get(slot, {}).items()):
+            # Do not expose engine helper masks. They are the usual source of
+            # opaque white rectangles over the face.
             visible = [r for r in sorted(recs, key=lambda x: x.index) if not _is_helper_mask_record(r)]
             if not visible:
                 continue
@@ -696,9 +710,30 @@ def _build_single_base_face_overlay_scene(
                 continue
             seen_options.add(sig)
             label = visible[0].name if len(visible) == 1 else " + ".join(r.name for r in visible)
-            body_options.append(LSFOption(f"face_{slot:02X}_{variant:02X}", label, visible))
+            options.append(LSFOption(f"{key_prefix}_{slot:02X}_{variant:02X}", label, visible))
+        return options
 
-    return fixed_records, body_options, notes
+    expr_index = 1
+    blush_index = 1
+    special_index = 1
+    for slot in sorted(s for s in slots.keys() if s != 0):
+        if slot == 0x0A:
+            opts = build_slot_options(slot, "(无表情)", "expr_face")
+            if len(opts) > 1:
+                expression_groups.append((f"表情{expr_index}", opts))
+                expr_index += 1
+        elif slot == 0x0B:
+            opts = build_slot_options(slot, "(无红晕)", "blush_face")
+            if len(opts) > 1:
+                blush_groups.append((f"红晕{blush_index}", opts))
+                blush_index += 1
+        else:
+            opts = build_slot_options(slot, "(无特殊)", "special_face")
+            if len(opts) > 1:
+                special_groups.append((f"特殊{special_index}", opts))
+                special_index += 1
+
+    return fixed_records, body_options, expression_groups, blush_groups, special_groups, notes
 
 
 
@@ -749,7 +784,14 @@ def analyze_lsf_scene(project: LSFProject) -> LSFScene:
     # rectangle covering the face. Build them as: fixed full image + optional face
     # overlays, with the default option set to the plain original image.
     if _is_single_base_face_overlay_scene(project, slots, canvas_area):
-        fixed_records, body_options, extra_notes = _build_single_base_face_overlay_scene(project, slots, canvas_area)
+        (
+            fixed_records,
+            body_options,
+            expression_groups,
+            blush_groups,
+            special_groups,
+            extra_notes,
+        ) = _build_single_base_face_overlay_scene(project, slots, canvas_area)
         notes.extend(extra_notes)
 
     # Background-like package: only one slot and all variants are large full-scene choices.
@@ -1548,8 +1590,13 @@ def analyze_lsf_scene(project: LSFProject) -> LSFScene:
     # 公共主体已被提升为 fixed_records 后，剩下的 body_options 全是空记录，
     # 界面会显示“身体 01 / 身体 02”但切换没有任何变化。这里折叠成一个“默认”。
     if body_options and all(len(opt.records) == 0 for opt in body_options):
-        body_options = [LSFOption("body_default", "默认", [])]
-        notes.append("检测到重复主体变体，已折叠为空默认选项。")
+        # 单张完整底图 + 表情/红晕差分的 EV 场景没有衣服/时间端可切换，保留“原图”语义；
+        # 其他重复主体资源才折叠为“默认”。
+        if any("单张 EV 底图 + 脸部差分" in n for n in notes):
+            body_options = [LSFOption("__none__", "原图", [])]
+        else:
+            body_options = [LSFOption("body_default", "默认", [])]
+            notes.append("检测到重复主体变体，已折叠为空默认选项。")
 
     if not body_options:
         body_options.append(LSFOption("body_default", "默认", []))
