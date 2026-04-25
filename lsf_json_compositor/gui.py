@@ -1,0 +1,2110 @@
+from __future__ import annotations
+
+import concurrent.futures
+import itertools
+import queue
+import re
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
+from pathlib import Path
+from typing import Optional
+
+from PIL import Image, ImageDraw, ImageTk
+
+from .core import (
+    JSONScene,
+    LSFOption,
+    LSFScene,
+    PNGResolver,
+    ProjectError,
+    analyze_json_scene,
+    analyze_lsf_scene,
+    collect_input_files,
+    compose_json_scene,
+    compose_lsf_scene,
+    parse_json_project,
+    parse_lsf_file,
+)
+
+TITLE = "Haisou Shoujo Series CG & Gareki Viewer & Extractor Ver1.0（ 由ユイ可愛ね制作 GPT编写 本软件免费使用，开源于Github，严禁倒卖牟利！）"
+SUPPORTED_SERIES_TEXT = """目前支持：
+廃村少女 ～妖し惑ひの籠の郷～ (原版）
+廃村少女 外伝 ～嬌絡夢現～
+廃村少女 番外 ～籠愛拾遺～
+廃村少女［弐］ ～陰り誘う秘姫の匣～"""
+
+APP_ICON_PNG = Path(__file__).resolve().parents[1] / "assets" / "app_icon.png"
+APP_ICON_ICO = Path(__file__).resolve().parents[1] / "assets" / "app_icon.ico"
+_APP_ICON_PHOTO: ImageTk.PhotoImage | None = None
+
+
+def apply_window_icon(win: tk.Misc) -> None:
+    """给主窗口和所有 Toplevel 二级窗口设置同一个程序图标。"""
+    global _APP_ICON_PHOTO
+    try:
+        if APP_ICON_ICO.exists() and hasattr(win, "iconbitmap"):
+            win.iconbitmap(str(APP_ICON_ICO))
+    except Exception:
+        # 某些非 Windows 环境或窗口管理器不支持 ico，继续尝试 PNG。
+        pass
+    try:
+        if _APP_ICON_PHOTO is None and APP_ICON_PNG.exists():
+            _APP_ICON_PHOTO = ImageTk.PhotoImage(file=str(APP_ICON_PNG))
+        if _APP_ICON_PHOTO is not None and hasattr(win, "iconphoto"):
+            win.iconphoto(True, _APP_ICON_PHOTO)
+    except Exception:
+        pass
+
+
+def make_checkerboard(width: int, height: int, cell: int = 16) -> Image.Image:
+    img = Image.new("RGBA", (width, height), (230, 230, 230, 255))
+    draw = ImageDraw.Draw(img)
+    c1 = (232, 232, 232, 255)
+    c2 = (205, 205, 205, 255)
+    for y in range(0, height, cell):
+        for x in range(0, width, cell):
+            draw.rectangle([x, y, x + cell - 1, y + cell - 1], fill=c1 if ((x // cell) + (y // cell)) % 2 == 0 else c2)
+    return img
+
+
+def count_dir_files(dir_text: str, patterns: tuple[str, ...]) -> int:
+    text = (dir_text or "").strip()
+    if not text:
+        return 0
+    p = Path(text).expanduser()
+    if not p.is_dir():
+        return 0
+    total = 0
+    for pattern in patterns:
+        total += len(list(p.glob(pattern)))
+    return total
+
+
+def safe_filename_part(text: str, max_len: int = 48) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"[\\/:*?\"<>|\r\n\t]+", "_", text)
+    text = re.sub(r"\s+", " ", text).strip(" ._")
+    if not text:
+        text = "未命名"
+    if len(text) > max_len:
+        text = text[:max_len].rstrip(" ._")
+    return text or "未命名"
+
+
+def make_unique_png_path(folder: Path, stem: str) -> Path:
+    base = safe_filename_part(stem, 160)
+    path = folder / f"{base}.png"
+    if not path.exists():
+        return path
+    for i in range(2, 10000):
+        alt = folder / f"{base}_{i:03d}.png"
+        if not alt.exists():
+            return alt
+    return folder / f"{base}_extra.png"
+
+
+THREAD_COUNT_CHOICES = ("2", "4", "6", "8", "12", "16")
+DEFAULT_THREAD_COUNT = "4"
+
+
+def make_unique_png_path_reserved(folder: Path, stem: str, reserved_paths: set[str]) -> Path:
+    """Like make_unique_png_path, but also avoids names already reserved by other worker threads."""
+    base = safe_filename_part(stem, 160)
+    candidates = [folder / f"{base}.png"]
+    candidates.extend(folder / f"{base}_{i:03d}.png" for i in range(2, 10000))
+    for path in candidates:
+        key = str(path.resolve()).lower()
+        if key not in reserved_paths and not path.exists():
+            reserved_paths.add(key)
+            return path
+    path = folder / f"{base}_extra_{len(reserved_paths) + 1:06d}.png"
+    reserved_paths.add(str(path.resolve()).lower())
+    return path
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def batch_progress_text(completed: int, total: int, start_time: float) -> str:
+    total = max(0, total)
+    completed = max(0, min(completed, total)) if total else completed
+    percent = 100.0 if total <= 0 else completed * 100.0 / total
+    if total <= 0:
+        eta = "00:00"
+    elif completed <= 0:
+        eta = "计算中"
+    elif completed >= total:
+        eta = "00:00"
+    else:
+        elapsed = max(0.0, time.time() - start_time)
+        eta = format_duration((elapsed / completed) * (total - completed))
+    return f"进度：{completed}/{total} ({percent:.1f}%)｜预计导出数量：{total}｜预计剩余时间：{eta}"
+
+
+class PreviewCanvas(ttk.Frame):
+    def __init__(self, master: tk.Misc, resolution_var: tk.StringVar):
+        super().__init__(master)
+        self.resolution_var = resolution_var
+        self.canvas = tk.Canvas(self, bg="#d0d0d0", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self._photo = None
+        self._last_image = None
+        self.canvas.bind("<Configure>", lambda e: self._refresh())
+
+    def show_image(self, image: Image.Image | None) -> None:
+        self._last_image = image
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.canvas.delete("all")
+        if self._last_image is None:
+            self.resolution_var.set("当前预览分辨率：- x -")
+            return
+        cw = max(100, self.canvas.winfo_width())
+        ch = max(100, self.canvas.winfo_height())
+        img = self._last_image
+        self.resolution_var.set(f"当前预览分辨率：{img.width} x {img.height}")
+        scale = min(cw / img.width, ch / img.height, 1.0)
+        disp = img
+        if scale != 1.0:
+            disp = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
+        bg = make_checkerboard(disp.width, disp.height)
+        bg.alpha_composite(disp, (0, 0))
+        self._photo = ImageTk.PhotoImage(bg)
+        self.canvas.create_image(cw // 2, ch // 2, image=self._photo, anchor="center")
+
+
+class WrapButtonFrame(ttk.Frame):
+    """紧凑按钮条：按钮按文字自然宽度显示，横向优先，空间不足时自动换行。"""
+
+    def __init__(self, master: tk.Misc, buttons: list[tuple[str, object]]):
+        super().__init__(master)
+        self._buttons: list[ttk.Button] = []
+        for text, command in buttons:
+            btn = ttk.Button(self, text=text, command=command)
+            self._buttons.append(btn)
+        self.bind("<Configure>", lambda _e: self._reflow())
+        self.after_idle(self._reflow)
+
+    def _reflow(self) -> None:
+        if not self._buttons:
+            return
+        available = max(1, self.winfo_width())
+        if available <= 1:
+            available = max(1, self.winfo_reqwidth())
+        row = 0
+        col = 0
+        used = 0
+        gap = 6
+        for btn in self._buttons:
+            btn.grid_forget()
+            btn_width = btn.winfo_reqwidth()
+            need = btn_width if col == 0 else btn_width + gap
+            if col > 0 and used + need > available:
+                row += 1
+                col = 0
+                used = 0
+                need = btn_width
+            btn.grid(row=row, column=col, padx=(0 if col == 0 else gap, 0), pady=(2, 4), sticky="w")
+            used += need
+            col += 1
+        for i in range(col + 1):
+            self.grid_columnconfigure(i, weight=0)
+
+
+class BaseTab(ttk.Frame):
+    def __init__(self, master: tk.Misc, mode_name: str):
+        super().__init__(master)
+        self.mode_name = mode_name
+        self.resolution_var = tk.StringVar(value="当前预览分辨率：- x -")
+        self._title_font = tkfont.nametofont("TkDefaultFont").copy()
+        self._title_font.configure(size=11, weight="bold")
+        self._res_font = tkfont.nametofont("TkDefaultFont").copy()
+        self._res_font.configure(size=12, weight="bold")
+
+        # 左侧操作区改成可滚动容器：组合项很多时，当前信息不会被挤出看不到。
+        self.left_shell = ttk.Frame(self)
+        self.left_shell.pack(side="left", fill="y", padx=8, pady=8)
+
+        self.left_canvas = tk.Canvas(self.left_shell, highlightthickness=0, borderwidth=0)
+        self.left_scrollbar = ttk.Scrollbar(self.left_shell, orient="vertical", command=self.left_canvas.yview)
+        self.left_canvas.configure(yscrollcommand=self.left_scrollbar.set)
+        self.left_canvas.pack(side="left", fill="y", expand=False)
+        self.left_scrollbar.pack(side="right", fill="y")
+
+        self.left = ttk.Frame(self.left_canvas)
+        self._left_window = self.left_canvas.create_window((0, 0), window=self.left, anchor="nw")
+        self._left_default_width = 410
+        self.left_canvas.configure(width=self._left_default_width)
+        self.left.bind("<Configure>", self._on_left_frame_configure)
+        self.left_canvas.bind("<Configure>", self._on_left_canvas_configure)
+        # 禁用左侧滚动区的鼠标滚轮：只能用鼠标拖动/点击右侧滚动条来滚动。
+        # 原来这里会在鼠标进入左侧区域时 bind_all <MouseWheel>/<Button-4>/<Button-5>，
+        # 导致滚轮也能移动滚动条；现在不再绑定滚轮事件。
+
+        self.right = ttk.Frame(self)
+        self.right.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=8)
+
+    def _on_left_frame_configure(self, _event=None) -> None:
+        self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+        req_width = max(self._left_default_width, self.left.winfo_reqwidth())
+        cur_width = int(float(self.left_canvas.cget("width")))
+        if req_width != cur_width:
+            self.left_canvas.configure(width=req_width)
+        self.left_canvas.itemconfigure(self._left_window, width=req_width)
+
+    def _on_left_canvas_configure(self, event=None) -> None:
+        width = max(self._left_default_width, event.width if event else self.left_canvas.winfo_width())
+        self.left_canvas.itemconfigure(self._left_window, width=width)
+        self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+
+    def _scroll_left_canvas(self, event) -> None:
+        if getattr(event, "num", None) == 4:
+            self.left_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.left_canvas.yview_scroll(1, "units")
+        else:
+            delta = int(-1 * (getattr(event, "delta", 0) / 120))
+            if delta:
+                self.left_canvas.yview_scroll(delta, "units")
+
+    def _bind_left_mousewheel(self) -> None:
+        root = self.winfo_toplevel()
+        root.bind_all("<MouseWheel>", self._scroll_left_canvas)
+        root.bind_all("<Button-4>", self._scroll_left_canvas)
+        root.bind_all("<Button-5>", self._scroll_left_canvas)
+
+    def _unbind_left_mousewheel(self) -> None:
+        root = self.winfo_toplevel()
+        root.unbind_all("<MouseWheel>")
+        root.unbind_all("<Button-4>")
+        root.unbind_all("<Button-5>")
+
+    def create_preview_area(self):
+        header = ttk.Frame(self.right)
+        header.pack(fill="x", anchor="nw")
+        ttk.Label(header, text="预览", font=self._title_font).pack(anchor="w")
+        ttk.Label(header, textvariable=self.resolution_var, font=self._res_font).pack(anchor="w", pady=(2, 8))
+        self.preview = PreviewCanvas(self.right, self.resolution_var)
+        self.preview.pack(fill="both", expand=True)
+
+    def create_info_box(self):
+        info_box = ttk.LabelFrame(self.left, text="当前信息")
+        info_box.pack(fill="both", expand=True, pady=(8, 0))
+        self.info_text = tk.Text(info_box, width=54, height=16)
+        self.info_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.info_text.configure(state="disabled")
+
+    def _place_popup_like_left_panel(self, win: tk.Toplevel) -> None:
+        # 所有二级弹窗与主程序窗口左上角对齐，并统一使用程序图标。
+        root = self.winfo_toplevel()
+        apply_window_icon(win)
+
+        def apply_position() -> None:
+            root.update_idletasks()
+            win.update_idletasks()
+            x = max(0, root.winfo_rootx())
+            y = max(0, root.winfo_rooty())
+            win.geometry(f"+{x}+{y}")
+            win.lift(root)
+            win.focus_force()
+
+        apply_position()
+        # Windows 下部分窗口管理器会在 transient/grab 后重新摆放一次，延迟再校准，避免飘到屏幕左上角。
+        win.after(50, apply_position)
+
+    def _set_info(self, lines: list[str]) -> None:
+        self.info_text.configure(state="normal")
+        self.info_text.delete("1.0", "end")
+        self.info_text.insert("1.0", "\n".join(lines))
+        self.info_text.configure(state="disabled")
+
+    def _path_row(self, parent: tk.Misc, label: str, variable: tk.StringVar, command, on_change=None) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(row, text=label, width=14).pack(side="left")
+        ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True, padx=(4, 4))
+        if on_change:
+            variable.trace_add("write", lambda *_: on_change())
+        ttk.Button(row, text="选择", command=command, width=8).pack(side="left")
+
+    def _compact_button_bar(self, parent: tk.Misc, buttons: list[tuple[str, object]]) -> WrapButtonFrame:
+        bar = WrapButtonFrame(parent, buttons)
+        bar.pack(fill="x", padx=8, pady=(2, 8), anchor="w")
+        return bar
+
+
+
+class LSFTab(BaseTab):
+    def __init__(self, master: tk.Misc):
+        super().__init__(master, "LSF")
+        self.lsf_files: list[Path] = []
+        self.scene: Optional[LSFScene] = None
+        self.resolver: Optional[PNGResolver] = None
+        self.current_image: Optional[Image.Image] = None
+
+        self.lsf_input_var = tk.StringVar()
+        self.png_var = tk.StringVar()
+        self.scene_var = tk.StringVar()
+        self.body_var = tk.StringVar()
+        self.linkage_vars: dict[str, tk.BooleanVar] = {}
+        self.linkage_summary_var = tk.StringVar(value="联动：未开启")
+        self.expression_vars: list[tk.StringVar] = []
+        self.blush_vars: list[tk.StringVar] = []
+        self.special_vars: list[tk.StringVar] = []
+        self.expression_combos: list[ttk.Combobox] = []
+        self.blush_combos: list[ttk.Combobox] = []
+        self.special_combos: list[ttk.Combobox] = []
+        self.holy_var = tk.StringVar()
+        self.stats_var = tk.StringVar(value="当前目录统计：LSF 0 个，PNG 0 个")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        input_box = ttk.LabelFrame(self.left, text="输入")
+        input_box.pack(fill="x", pady=(0, 8))
+        self._path_row(input_box, "LSF 目录", self.lsf_input_var, self._pick_lsf_dir, self._on_dir_changed)
+        self._path_row(input_box, "PNG 目录", self.png_var, self._pick_png, self._on_dir_changed)
+        self._compact_button_bar(input_box, [
+            ("加载 LSF 项目", self.load_project),
+            ("导出当前 PNG", self.export_current),
+            ("批量导出当前组合", self.open_batch_export_dialog),
+            ("支持系列", self.open_supported_series_dialog),
+        ])
+
+        stats_box = ttk.LabelFrame(self.left, text="目录统计")
+        stats_box.pack(fill="x", pady=(0, 8))
+        ttk.Label(stats_box, textvariable=self.stats_var, justify="left", anchor="w").pack(fill="x", padx=8, pady=8)
+
+        linkage_box = ttk.LabelFrame(self.left, text="联动")
+        linkage_box.pack(fill="x", pady=(0, 8))
+        ttk.Button(linkage_box, text="联动设置", command=self.open_linkage_dialog).pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(linkage_box, textvariable=self.linkage_summary_var, justify="left", anchor="w").pack(fill="x", padx=8, pady=(0, 8))
+
+        options = ttk.LabelFrame(self.left, text="组合选项")
+        options.pack(fill="x")
+        ttk.Label(options, text="人物或者场景").pack(anchor="w", padx=8, pady=(8, 2))
+        self.scene_combo = ttk.Combobox(options, textvariable=self.scene_var, state="readonly", width=48)
+        self.scene_combo.pack(fill="x", padx=8)
+        self.scene_combo.bind("<<ComboboxSelected>>", lambda e: self._load_selected_scene())
+
+        ttk.Label(options, text="衣服或者其他时间端").pack(anchor="w", padx=8, pady=(8, 2))
+        self.body_combo = ttk.Combobox(options, textvariable=self.body_var, state="readonly", width=48)
+        self.body_combo.pack(fill="x", padx=8)
+        self.body_combo.bind("<<ComboboxSelected>>", lambda e: self._on_body_selected())
+
+        self.group_controls_frame = ttk.Frame(options)
+        self.group_controls_frame.pack(fill="x")
+
+        ttk.Label(options, text="圣光").pack(anchor="w", padx=8, pady=(8, 2))
+        self.holy_combo = ttk.Combobox(options, textvariable=self.holy_var, state="readonly", width=48)
+        self.holy_combo.pack(fill="x", padx=8, pady=(0, 8))
+        self.holy_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_preview())
+
+        self.create_info_box()
+        self.create_preview_area()
+
+
+
+    def _rebuild_group_controls(self, expression_groups, blush_groups, special_groups) -> None:
+        for child in self.group_controls_frame.winfo_children():
+            child.destroy()
+        self.expression_vars = []
+        self.blush_vars = []
+        self.special_vars = []
+        self.expression_combos = []
+        self.blush_combos = []
+        self.special_combos = []
+
+        for i, (_group_name, options) in enumerate(expression_groups, start=1):
+            var = tk.StringVar()
+            self.expression_vars.append(var)
+            ttk.Label(self.group_controls_frame, text=_group_name or f"表情{i}").pack(anchor="w", padx=8, pady=(8, 2))
+            combo = ttk.Combobox(self.group_controls_frame, textvariable=var, state="readonly", width=48)
+            combo.pack(fill="x", padx=8)
+            combo["values"] = [x.label for x in options]
+            if len(options) > 1:
+                var.set(options[1].label)
+            else:
+                var.set(options[0].label if options else "")
+            combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_preview())
+            self.expression_combos.append(combo)
+
+        for i, (_group_name, options) in enumerate(blush_groups, start=1):
+            var = tk.StringVar()
+            self.blush_vars.append(var)
+            ttk.Label(self.group_controls_frame, text=_group_name or f"红晕{i}").pack(anchor="w", padx=8, pady=(8, 2))
+            combo = ttk.Combobox(self.group_controls_frame, textvariable=var, state="readonly", width=48)
+            combo.pack(fill="x", padx=8)
+            combo["values"] = [x.label for x in options]
+            var.set(options[0].label if options else "")
+            combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_preview())
+            self.blush_combos.append(combo)
+
+        for i, (_group_name, options) in enumerate(special_groups, start=1):
+            var = tk.StringVar()
+            self.special_vars.append(var)
+            ttk.Label(self.group_controls_frame, text=_group_name or f"特殊{i}").pack(anchor="w", padx=8, pady=(8, 2))
+            combo = ttk.Combobox(self.group_controls_frame, textvariable=var, state="readonly", width=48)
+            combo.pack(fill="x", padx=8)
+            combo["values"] = [x.label for x in options]
+            var.set(options[0].label if options else "")
+            combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_preview())
+            self.special_combos.append(combo)
+
+    def _label_is_none_choice(self, label: str) -> bool:
+        return label.startswith("(") or label.startswith("原图")
+
+    def _advance_combobox(self, combo: ttk.Combobox, var: tk.StringVar, *, skip_none_choices: bool = False) -> bool:
+        values = list(combo["values"] or [])
+        if not values or str(combo.cget("state")) == "disabled":
+            return False
+
+        current = var.get()
+        try:
+            current_idx = values.index(current)
+        except ValueError:
+            current_idx = -1
+
+        usable_indices = list(range(len(values)))
+        if skip_none_choices and len(values) > 1:
+            real_indices = [i for i, label in enumerate(values) if not self._label_is_none_choice(str(label))]
+            if real_indices:
+                usable_indices = real_indices
+
+        if current_idx in usable_indices:
+            pos = usable_indices.index(current_idx)
+            next_idx = usable_indices[(pos + 1) % len(usable_indices)]
+        else:
+            next_idx = next((i for i in usable_indices if i > current_idx), usable_indices[0])
+
+        var.set(values[next_idx])
+        return True
+
+    def _get_linkage_var(self, key: str) -> tk.BooleanVar:
+        if key not in self.linkage_vars:
+            self.linkage_vars[key] = tk.BooleanVar(value=False)
+        return self.linkage_vars[key]
+
+    def _iter_link_targets(self):
+        for i, (combo, var) in enumerate(zip(self.expression_combos, self.expression_vars), start=1):
+            yield f"expression_{i}", f"表情{i}", combo, var
+        for i, (combo, var) in enumerate(zip(self.blush_combos, self.blush_vars), start=1):
+            yield f"blush_{i}", f"红晕{i}", combo, var
+        for i, (combo, var) in enumerate(zip(self.special_combos, self.special_vars), start=1):
+            yield f"special_{i}", f"特殊{i}", combo, var
+        yield "holy", "圣光", self.holy_combo, self.holy_var
+
+    def _combo_has_real_options(self, combo: ttk.Combobox) -> bool:
+        values = list(combo["values"] or [])
+        if str(combo.cget("state")) == "disabled":
+            return False
+        return any(not self._label_is_none_choice(str(v)) for v in values)
+
+    def _update_linkage_summary(self) -> None:
+        selected = []
+        for key, label, combo, _var in self._iter_link_targets():
+            if self._get_linkage_var(key).get() and self._combo_has_real_options(combo):
+                selected.append(label)
+        if selected:
+            self.linkage_summary_var.set("联动：" + "、".join(selected))
+        else:
+            self.linkage_summary_var.set("联动：未开启")
+
+    def open_linkage_dialog(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("联动设置")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        win.resizable(False, False)
+
+        ttk.Label(
+            win,
+            text="勾选后：手动切换“衣服或者其他时间端”时，下面这些选项会各自切到下一项。",
+            wraplength=360,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(12, 8))
+
+        frame = ttk.LabelFrame(win, text="可联动项目")
+        frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        targets = list(self._iter_link_targets())
+        if not targets:
+            ttk.Label(frame, text="请先加载 LSF 项目。").pack(anchor="w", padx=8, pady=8)
+        else:
+            for key, label, combo, _var in targets:
+                bool_var = self._get_linkage_var(key)
+                available = self._combo_has_real_options(combo)
+                text = label if available else f"{label}（当前无可用选项）"
+                cb = ttk.Checkbutton(frame, text=text, variable=bool_var, command=self._update_linkage_summary)
+                cb.pack(anchor="w", padx=8, pady=3)
+                if not available:
+                    cb.state(["disabled"])
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+
+        def select_all_available() -> None:
+            for key, _label, combo, _var in self._iter_link_targets():
+                if self._combo_has_real_options(combo):
+                    self._get_linkage_var(key).set(True)
+            self._update_linkage_summary()
+
+        def clear_all() -> None:
+            for key, _label, _combo, _var in self._iter_link_targets():
+                self._get_linkage_var(key).set(False)
+            self._update_linkage_summary()
+
+        ttk.Button(btns, text="全选可用", command=select_all_available).pack(side="left")
+        ttk.Button(btns, text="清空", command=clear_all).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
+        self._place_popup_like_left_panel(win)
+
+    def _on_body_selected(self) -> None:
+        for key, _label, combo, var in self._iter_link_targets():
+            if self._get_linkage_var(key).get() and self._combo_has_real_options(combo):
+                self._advance_combobox(combo, var, skip_none_choices=True)
+        self.refresh_preview()
+
+    def _pick_lsf_dir(self) -> None:
+        folder = filedialog.askdirectory()
+        if folder:
+            self.lsf_input_var.set(folder)
+            self.png_var.set(folder)
+
+    def _pick_png(self) -> None:
+        folder = filedialog.askdirectory()
+        if folder:
+            self.png_var.set(folder)
+
+    def _on_dir_changed(self) -> None:
+        lsf_count = count_dir_files(self.lsf_input_var.get(), ("*.lsf",))
+        png_count = count_dir_files(self.png_var.get(), ("*.png",))
+        self.stats_var.set(f"当前目录统计：LSF {lsf_count} 个，PNG {png_count} 个")
+
+    def load_project(self) -> None:
+        try:
+            self.lsf_files = collect_input_files(self.lsf_input_var.get(), ("*.lsf",))
+            if not self.lsf_files:
+                raise ProjectError("请先选择包含 LSF 的目录。")
+            if not self.png_var.get().strip():
+                self.png_var.set(self.lsf_input_var.get().strip())
+            if not self.png_var.get().strip():
+                raise ProjectError("请先选择 PNG 目录。")
+            self.resolver = PNGResolver(self.png_var.get().strip())
+            self._on_dir_changed()
+            scene_names = [p.name for p in self.lsf_files]
+            self.scene_combo["values"] = scene_names
+            self.scene_var.set(scene_names[0])
+            self._load_selected_scene()
+        except Exception as exc:
+            messagebox.showerror("加载失败", str(exc))
+
+    def _apply_group_to_combo(self, combo: ttk.Combobox, var: tk.StringVar, groups, idx: int, none_label: str) -> None:
+        if idx < len(groups):
+            _group_name, options = groups[idx]
+            combo["values"] = [x.label for x in options]
+            if len(options) > 1:
+                var.set(options[1].label)
+            else:
+                var.set(options[0].label if options else "")
+            combo.state(["!disabled", "readonly"])
+        else:
+            combo["values"] = [none_label]
+            var.set(none_label)
+            combo.state(["disabled"])
+
+    def _load_selected_scene(self) -> None:
+        try:
+            selected = self.scene_var.get().strip()
+            if not selected:
+                return
+            path = next((p for p in self.lsf_files if p.name == selected), None)
+            if not path:
+                return
+            self.scene = analyze_lsf_scene(parse_lsf_file(path))
+            self.body_combo["values"] = [x.label for x in self.scene.body_options]
+            if len(self.scene.body_options) > 1 and self.scene.body_options[0].key == "__none__":
+                self.body_var.set(self.scene.body_options[1].label)
+            else:
+                self.body_var.set(self.scene.body_options[0].label if self.scene.body_options else "")
+
+            self._rebuild_group_controls(self.scene.expression_groups, self.scene.blush_groups, self.scene.special_groups)
+
+            self.holy_combo["values"] = [x.label for x in self.scene.holy_options]
+            self.holy_var.set(self.scene.holy_options[0].label if self.scene.holy_options else "")
+            if len(self.scene.holy_options) <= 1:
+                self.holy_combo.state(["disabled"])
+            else:
+                self.holy_combo.state(["!disabled", "readonly"])
+            self._update_linkage_summary()
+            self.refresh_preview()
+        except Exception as exc:
+            messagebox.showerror("读取 LSF 失败", str(exc))
+
+    def _find_option(self, options: list[LSFOption], selected_label: str) -> Optional[LSFOption]:
+        for item in options:
+            if item.label == selected_label:
+                return item
+        return options[0] if options else None
+
+    def refresh_preview(self) -> None:
+        if not self.scene or not self.resolver:
+            return
+        body = self._find_option(self.scene.body_options, self.body_var.get())
+        exprs: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(self.scene.expression_groups):
+            if i < len(self.expression_vars):
+                opt = self._find_option(opts, self.expression_vars[i].get())
+                exprs.append(None if opt and opt.key == "__none__" else opt)
+        blushes: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(self.scene.blush_groups):
+            if i < len(self.blush_vars):
+                opt = self._find_option(opts, self.blush_vars[i].get())
+                blushes.append(None if opt and opt.key == "__none__" else opt)
+        specials: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(self.scene.special_groups):
+            if i < len(self.special_vars):
+                opt = self._find_option(opts, self.special_vars[i].get())
+                specials.append(None if opt and opt.key == "__none__" else opt)
+        holy = self._find_option(self.scene.holy_options, self.holy_var.get())
+        image, warnings, records = compose_lsf_scene(
+            self.scene,
+            self.resolver,
+            body if body and body.records is not None else None,
+            exprs,
+            blushes,
+            None if holy and holy.key == "__none__" else holy,
+            specials,
+        )
+        self.current_image = image
+        self.preview.show_image(image)
+
+        lines = [
+            f"LSF: {self.scene.project.lsf_path.name}",
+            f"画布: {self.scene.project.canvas_width} x {self.scene.project.canvas_height}",
+            f"已加载 LSF 数: {len(self.lsf_files)}",
+            f"已索引 PNG 数: {len(self.resolver.by_stem) if self.resolver else 0}",
+            f"衣服或者其他时间端: {body.label if body else '(无)'}",
+        ]
+        for i, expr in enumerate(exprs, start=1):
+            lines.append(f"表情{i}: {expr.label if expr else '(无表情)'}")
+        for i, blush in enumerate(blushes, start=1):
+            lines.append(f"红晕{i}: {blush.label if blush else '(无红晕)'}")
+        for i, sp in enumerate(specials, start=1):
+            lines.append(f"特殊{i}: {sp.label if sp else '(无特殊)'}")
+        lines += [
+            f"圣光: {holy.label if holy and holy.key != '__none__' else '(无圣光)'}",
+            f"当前合成图层数: {len(records)}",
+            "",
+            "分析结果:",
+            *[f"  - {n}" for n in self.scene.notes],
+        ]
+        if warnings:
+            lines += ["", "警告:", *[f"  - {w}" for w in warnings]]
+        self._set_info(lines)
+
+    def export_current(self) -> None:
+        if self.current_image is None:
+            messagebox.showinfo("提示", "没有可导出的预览图。")
+            return
+        out = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
+        if out:
+            self.current_image.save(out)
+            messagebox.showinfo("完成", f"已导出: {out}")
+
+
+    def _target_values_from_combo(self, combo: ttk.Combobox, *, real_only: bool = True) -> list[str]:
+        values = [str(v) for v in list(combo["values"] or [])]
+        if real_only:
+            real = [v for v in values if not self._label_is_none_choice(v)]
+            return real if real else values
+        return values
+
+    def _advance_label_value(self, values: list[str], current: str, *, skip_none_choices: bool = True) -> str:
+        if not values:
+            return current
+        usable = values
+        if skip_none_choices and len(values) > 1:
+            real = [v for v in values if not self._label_is_none_choice(v)]
+            if real:
+                usable = real
+        try:
+            current_idx = values.index(current)
+        except ValueError:
+            current_idx = -1
+        usable_indices = [values.index(v) for v in usable if v in values]
+        if not usable_indices:
+            return current
+        if current_idx in usable_indices:
+            pos = usable_indices.index(current_idx)
+            return values[usable_indices[(pos + 1) % len(usable_indices)]]
+        next_idx = next((i for i in usable_indices if i > current_idx), usable_indices[0])
+        return values[next_idx]
+
+    def _iter_batch_targets(self):
+        yield "body", "衣服或者其他时间端", self.body_combo, self.body_var
+        yield from self._iter_link_targets()
+
+    def _current_lsf_selection(self) -> dict[str, str]:
+        selection: dict[str, str] = {"body": self.body_var.get(), "holy": self.holy_var.get()}
+        for i, var in enumerate(self.expression_vars, start=1):
+            selection[f"expression_{i}"] = var.get()
+        for i, var in enumerate(self.blush_vars, start=1):
+            selection[f"blush_{i}"] = var.get()
+        for i, var in enumerate(self.special_vars, start=1):
+            selection[f"special_{i}"] = var.get()
+        return selection
+
+    def _compose_lsf_selection(self, selection: dict[str, str]) -> tuple[Image.Image, list[str], list[LSFOption]]:
+        if not self.scene or not self.resolver:
+            raise ProjectError("请先加载 LSF 项目。")
+        body = self._find_option(self.scene.body_options, selection.get("body", self.body_var.get()))
+        exprs: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(self.scene.expression_groups, start=1):
+            opt = self._find_option(opts, selection.get(f"expression_{i}", self.expression_vars[i - 1].get() if i - 1 < len(self.expression_vars) else ""))
+            exprs.append(None if opt and opt.key == "__none__" else opt)
+        blushes: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(self.scene.blush_groups, start=1):
+            opt = self._find_option(opts, selection.get(f"blush_{i}", self.blush_vars[i - 1].get() if i - 1 < len(self.blush_vars) else ""))
+            blushes.append(None if opt and opt.key == "__none__" else opt)
+        specials: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(self.scene.special_groups, start=1):
+            opt = self._find_option(opts, selection.get(f"special_{i}", self.special_vars[i - 1].get() if i - 1 < len(self.special_vars) else ""))
+            specials.append(None if opt and opt.key == "__none__" else opt)
+        holy = self._find_option(self.scene.holy_options, selection.get("holy", self.holy_var.get()))
+        image, warnings, records = compose_lsf_scene(
+            self.scene,
+            self.resolver,
+            body if body and body.records is not None else None,
+            exprs,
+            blushes,
+            None if holy and holy.key == "__none__" else holy,
+            specials,
+        )
+        return image, warnings, records  # type: ignore[return-value]
+
+    def _selection_filename(self, index: int, selection: dict[str, str], selected_keys: list[str]) -> str:
+        scene_stem = self.scene.project.stem if self.scene else "scene"
+        parts = [safe_filename_part(scene_stem, 40), f"{index:04d}"]
+        for key, label, _combo, _var in self._iter_batch_targets():
+            if key in selected_keys:
+                parts.append(safe_filename_part(selection.get(key, ""), 32))
+        return "__".join([p for p in parts if p])
+
+    def _values_from_labels(self, values: list[str], *, real_only: bool = True) -> list[str]:
+        values = [str(v) for v in values]
+        if real_only:
+            real = [v for v in values if not self._label_is_none_choice(v)]
+            return real if real else values
+        return values
+
+    def _lsf_targets_for_scene(self, scene: LSFScene) -> list[tuple[str, str, list[str]]]:
+        targets: list[tuple[str, str, list[str]]] = []
+        targets.append(("body", "衣服或者其他时间端", [x.label for x in scene.body_options]))
+        for i, (_name, options) in enumerate(scene.expression_groups, start=1):
+            targets.append((f"expression_{i}", f"表情{i}", [x.label for x in options]))
+        for i, (_name, options) in enumerate(scene.blush_groups, start=1):
+            targets.append((f"blush_{i}", f"红晕{i}", [x.label for x in options]))
+        for i, (_name, options) in enumerate(scene.special_groups, start=1):
+            targets.append((f"special_{i}", f"特殊{i}", [x.label for x in options]))
+        targets.append(("holy", "圣光", [x.label for x in scene.holy_options]))
+        return targets
+
+    def _default_lsf_selection_for_scene(self, scene: LSFScene) -> dict[str, str]:
+        selection: dict[str, str] = {}
+        if scene.body_options:
+            if len(scene.body_options) > 1 and scene.body_options[0].key == "__none__":
+                selection["body"] = scene.body_options[1].label
+            else:
+                selection["body"] = scene.body_options[0].label
+        for i, (_name, options) in enumerate(scene.expression_groups, start=1):
+            if options:
+                selection[f"expression_{i}"] = options[1].label if len(options) > 1 else options[0].label
+        for i, (_name, options) in enumerate(scene.blush_groups, start=1):
+            if options:
+                selection[f"blush_{i}"] = options[0].label
+        for i, (_name, options) in enumerate(scene.special_groups, start=1):
+            if options:
+                selection[f"special_{i}"] = options[0].label
+        if scene.holy_options:
+            selection["holy"] = scene.holy_options[0].label
+        return selection
+
+    def _compose_lsf_selection_for_scene(self, scene: LSFScene, selection: dict[str, str]) -> tuple[Image.Image, list[str], list[LSFOption]]:
+        if not self.resolver:
+            raise ProjectError("请先加载 PNG 目录。")
+        body = self._find_option(scene.body_options, selection.get("body", ""))
+        exprs: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(scene.expression_groups, start=1):
+            opt = self._find_option(opts, selection.get(f"expression_{i}", ""))
+            exprs.append(None if opt and opt.key == "__none__" else opt)
+        blushes: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(scene.blush_groups, start=1):
+            opt = self._find_option(opts, selection.get(f"blush_{i}", ""))
+            blushes.append(None if opt and opt.key == "__none__" else opt)
+        specials: list[Optional[LSFOption]] = []
+        for i, (_name, opts) in enumerate(scene.special_groups, start=1):
+            opt = self._find_option(opts, selection.get(f"special_{i}", ""))
+            specials.append(None if opt and opt.key == "__none__" else opt)
+        holy = self._find_option(scene.holy_options, selection.get("holy", ""))
+        image, warnings, records = compose_lsf_scene(
+            scene,
+            self.resolver,
+            body if body and body.records is not None else None,
+            exprs,
+            blushes,
+            None if holy and holy.key == "__none__" else holy,
+            specials,
+        )
+        return image, warnings, records  # type: ignore[return-value]
+
+    def _selection_filename_for_scene(self, scene: LSFScene, index: int, selection: dict[str, str], selected_keys: list[str]) -> str:
+        parts = [safe_filename_part(scene.project.stem, 40), f"{index:04d}"]
+        for key, _label, _values in self._lsf_targets_for_scene(scene):
+            if key in selected_keys:
+                parts.append(safe_filename_part(selection.get(key, ""), 32))
+        return "__".join([p for p in parts if p])
+
+    def _estimate_lsf_scene_export(self, scene: LSFScene, selected_keys: list[str], mode: str) -> int:
+        targets = self._lsf_targets_for_scene(scene)
+        valid_keys = [k for k in selected_keys if any(t[0] == k for t in targets)]
+        if mode == "product":
+            estimate = 1
+            any_selected = False
+            for key, _label, values in targets:
+                if key in valid_keys:
+                    any_selected = True
+                    estimate *= max(1, len(self._values_from_labels(values, real_only=True)))
+            return estimate if any_selected else 1
+        if "body" in valid_keys:
+            body_values = next((values for key, _label, values in targets if key == "body"), [])
+            return max(1, len(self._values_from_labels(body_values, real_only=True)))
+        counts = [len(self._values_from_labels(values, real_only=True)) for key, _label, values in targets if key in valid_keys]
+        return max(counts or [1])
+
+    def _iter_lsf_scene_export_jobs(self, scene: LSFScene, selected_keys: list[str], mode: str, current: Optional[dict[str, str]] = None):
+        current = dict(current or self._default_lsf_selection_for_scene(scene))
+        targets = self._lsf_targets_for_scene(scene)
+        valid_selected_keys = [k for k in selected_keys if any(t[0] == k for t in targets)]
+        filename_keys = valid_selected_keys or ["body"]
+
+        if mode == "product":
+            value_lists: list[tuple[str, list[str]]] = []
+            for key, _label, values in targets:
+                if key in valid_selected_keys:
+                    vals = self._values_from_labels(values, real_only=True)
+                    if vals:
+                        value_lists.append((key, vals))
+            combos = itertools.product(*[vals for _key, vals in value_lists]) if value_lists else [()]
+            for idx, values in enumerate(combos, start=1):
+                selection = dict(current)
+                for (key, _vals), value in zip(value_lists, values):
+                    selection[key] = value
+                yield idx, scene, selection, filename_keys
+        else:
+            count = self._estimate_lsf_scene_export(scene, valid_selected_keys, mode)
+            selection = dict(current)
+            for idx in range(1, count + 1):
+                yield idx, scene, dict(selection), filename_keys
+                if idx < count:
+                    for key, _label, values in targets:
+                        if key in valid_selected_keys:
+                            selection[key] = self._advance_label_value(values, selection.get(key, ""), skip_none_choices=True)
+
+    def _collect_lsf_batch_jobs(self, selected_keys: list[str], mode: str, scope: str):
+        if not self.scene or not self.resolver:
+            raise ProjectError("请先加载 LSF 项目。")
+        if scope == "directory":
+            jobs = []
+            for path in self.lsf_files:
+                scene = analyze_lsf_scene(parse_lsf_file(path))
+                jobs.extend(self._iter_lsf_scene_export_jobs(scene, selected_keys, mode))
+            return jobs
+        return list(self._iter_lsf_scene_export_jobs(self.scene, selected_keys, mode, self._current_lsf_selection()))
+
+    def _export_lsf_batch_job(self, out_dir: Path, job, filename_lock: threading.Lock, reserved_paths: set[str]) -> int:
+        idx, scene, selection, filename_keys = job
+        img, warnings, _records = self._compose_lsf_selection_for_scene(scene, selection)
+        filename = self._selection_filename_for_scene(scene, idx, selection, filename_keys)
+        with filename_lock:
+            out_path = make_unique_png_path_reserved(out_dir, filename, reserved_paths)
+        img.save(out_path)
+        return len(warnings)
+
+    def _run_lsf_batch_export_threaded(
+        self,
+        out_dir: Path,
+        selected_keys: list[str],
+        mode: str,
+        scope: str = "current",
+        thread_count: int = 4,
+        progress_callback=None,
+    ) -> tuple[int, int]:
+        if not self.scene or not self.resolver:
+            raise ProjectError("请先加载 LSF 项目。")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        jobs = self._collect_lsf_batch_jobs(selected_keys, mode, scope)
+        total = len(jobs)
+        if progress_callback:
+            progress_callback(0, total, 0)
+        if not jobs:
+            return 0, 0
+
+        max_workers = max(1, min(int(thread_count or 4), 16))
+        filename_lock = threading.Lock()
+        reserved_paths: set[str] = set()
+        completed = 0
+        warnings_total = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(self._export_lsf_batch_job, out_dir, job, filename_lock, reserved_paths)
+                for job in jobs
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    warnings_total += future.result()
+                except Exception:
+                    for f in futures:
+                        f.cancel()
+                    raise
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, total, warnings_total)
+        return completed, warnings_total
+
+    def _run_lsf_batch_export_for_scene(self, scene: LSFScene, out_dir: Path, selected_keys: list[str], mode: str, current: Optional[dict[str, str]] = None) -> tuple[int, int]:
+        current = dict(current or self._default_lsf_selection_for_scene(scene))
+        targets = self._lsf_targets_for_scene(scene)
+        selected_keys = [k for k in selected_keys if any(t[0] == k for t in targets)]
+        warnings_total = 0
+        exported = 0
+
+        if mode == "product":
+            value_lists: list[tuple[str, list[str]]] = []
+            for key, _label, values in targets:
+                if key in selected_keys:
+                    vals = self._values_from_labels(values, real_only=True)
+                    if vals:
+                        value_lists.append((key, vals))
+            combos = itertools.product(*[vals for _key, vals in value_lists]) if value_lists else [()]
+            for idx, values in enumerate(combos, start=1):
+                selection = dict(current)
+                for (key, _vals), value in zip(value_lists, values):
+                    selection[key] = value
+                img, warnings, _records = self._compose_lsf_selection_for_scene(scene, selection)
+                warnings_total += len(warnings)
+                filename = self._selection_filename_for_scene(scene, idx, selection, selected_keys or ["body"])
+                img.save(make_unique_png_path(out_dir, filename))
+                exported += 1
+        else:
+            count = self._estimate_lsf_scene_export(scene, selected_keys, mode)
+            selection = dict(current)
+            for idx in range(1, count + 1):
+                img, warnings, _records = self._compose_lsf_selection_for_scene(scene, selection)
+                warnings_total += len(warnings)
+                filename = self._selection_filename_for_scene(scene, idx, selection, selected_keys or ["body"])
+                img.save(make_unique_png_path(out_dir, filename))
+                exported += 1
+                if idx < count:
+                    for key, _label, values in targets:
+                        if key in selected_keys:
+                            selection[key] = self._advance_label_value(values, selection.get(key, ""), skip_none_choices=True)
+        return exported, warnings_total
+
+    def _run_lsf_batch_export(self, out_dir: Path, selected_keys: list[str], mode: str, scope: str = "current") -> tuple[int, int]:
+        if not self.scene or not self.resolver:
+            raise ProjectError("请先加载 LSF 项目。")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if scope == "directory":
+            exported = 0
+            warnings_total = 0
+            for path in self.lsf_files:
+                scene = analyze_lsf_scene(parse_lsf_file(path))
+                e, w = self._run_lsf_batch_export_for_scene(scene, out_dir, selected_keys, mode)
+                exported += e
+                warnings_total += w
+            return exported, warnings_total
+        return self._run_lsf_batch_export_for_scene(self.scene, out_dir, selected_keys, mode, self._current_lsf_selection())
+
+    def open_supported_series_dialog(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("支持系列")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        win.resizable(False, False)
+
+        ttk.Label(
+            win,
+            text=SUPPORTED_SERIES_TEXT,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=16, pady=(14, 12))
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=16, pady=(0, 14))
+        ttk.Button(btns, text="确定", command=win.destroy, width=10).pack(side="right")
+        self._place_popup_like_left_panel(win)
+
+    def open_batch_export_dialog(self) -> None:
+        if not self.scene or not self.resolver:
+            messagebox.showinfo("提示", "请先加载 LSF 项目。")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("批量导出当前组合")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        win.resizable(False, False)
+
+        default_folder = Path(self.png_var.get().strip() or ".").expanduser() / "batch_export"
+        out_var = tk.StringVar(value=str(default_folder))
+        mode_var = tk.StringVar(value="sequence")
+        scope_var = tk.StringVar(value="current")
+        thread_var = tk.StringVar(value=DEFAULT_THREAD_COUNT)
+        check_vars: dict[str, tk.BooleanVar] = {}
+
+        ttk.Label(
+            win,
+            text="选择哪些下拉项参与批量导出。默认按当前“联动设置”勾选；也可以手动改。",
+            wraplength=420,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(12, 8))
+
+        out_frame = ttk.LabelFrame(win, text="输出目录")
+        out_frame.pack(fill="x", padx=12, pady=(0, 8))
+        row = ttk.Frame(out_frame)
+        row.pack(fill="x", padx=8, pady=8)
+        ttk.Entry(row, textvariable=out_var, width=44).pack(side="left", fill="x", expand=True)
+
+        def choose_out_dir() -> None:
+            folder = filedialog.askdirectory(parent=win)
+            if folder:
+                out_var.set(folder)
+
+        def use_loaded_dir() -> None:
+            folder = self.lsf_input_var.get().strip() or self.png_var.get().strip()
+            if folder:
+                out_var.set(folder)
+
+        ttk.Button(row, text="选择", command=choose_out_dir, width=8).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="当前目录", command=use_loaded_dir, width=10).pack(side="left", padx=(6, 0))
+
+        mode_frame = ttk.LabelFrame(win, text="导出方式")
+        mode_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Radiobutton(
+            mode_frame,
+            text="联动序列：以当前选择为起点，逐项切换时间端；勾选项跟着下一项",
+            variable=mode_var,
+            value="sequence",
+        ).pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Radiobutton(
+            mode_frame,
+            text="全组合：把勾选项的所有真实选项全部排列组合导出",
+            variable=mode_var,
+            value="product",
+        ).pack(anchor="w", padx=8, pady=(2, 6))
+
+        scope_frame = ttk.LabelFrame(win, text="导出范围")
+        scope_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Radiobutton(
+            scope_frame,
+            text="只导出当前选中的 LSF",
+            variable=scope_var,
+            value="current",
+        ).pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Radiobutton(
+            scope_frame,
+            text="导出当前加载目录里的全部 LSF",
+            variable=scope_var,
+            value="directory",
+        ).pack(anchor="w", padx=8, pady=(2, 6))
+
+        thread_frame = ttk.LabelFrame(win, text="多线程")
+        thread_frame.pack(fill="x", padx=12, pady=(0, 8))
+        thread_row = ttk.Frame(thread_frame)
+        thread_row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(thread_row, text="导出线程数量").pack(side="left")
+        thread_combo = ttk.Combobox(
+            thread_row,
+            textvariable=thread_var,
+            values=THREAD_COUNT_CHOICES,
+            state="readonly",
+            width=6,
+        )
+        thread_combo.pack(side="left", padx=(8, 8))
+        ttk.Label(thread_row, text="默认 4；可选 2 / 4 / 6 / 8 / 12 / 16").pack(side="left")
+
+        target_frame = ttk.LabelFrame(win, text="参与批量的选项")
+        target_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        targets = list(self._iter_batch_targets())
+        for key, label, combo, _var in targets:
+            available = self._combo_has_real_options(combo)
+            default_checked = key == "body" or (key in self.linkage_vars and self._get_linkage_var(key).get())
+            var = tk.BooleanVar(value=bool(default_checked and available))
+            check_vars[key] = var
+            text = label if available else f"{label}（当前无可用选项）"
+            cb = ttk.Checkbutton(target_frame, text=text, variable=var)
+            cb.pack(anchor="w", padx=8, pady=2)
+            if not available:
+                cb.state(["disabled"])
+
+        btns1 = ttk.Frame(win)
+        btns1.pack(fill="x", padx=12, pady=(0, 8))
+
+        def apply_linkage_setting() -> None:
+            for key, _label, combo, _var in targets:
+                if not self._combo_has_real_options(combo):
+                    check_vars[key].set(False)
+                elif key == "body":
+                    check_vars[key].set(True)
+                else:
+                    check_vars[key].set(self._get_linkage_var(key).get())
+
+        def select_all_available() -> None:
+            for key, _label, combo, _var in targets:
+                check_vars[key].set(self._combo_has_real_options(combo))
+
+        def clear_all() -> None:
+            for key in check_vars:
+                check_vars[key].set(False)
+
+        ttk.Button(btns1, text="按联动设置选择", command=apply_linkage_setting).pack(side="left")
+        ttk.Button(btns1, text="全选可用", command=select_all_available).pack(side="left", padx=(8, 0))
+        ttk.Button(btns1, text="清空", command=clear_all).pack(side="left", padx=(8, 0))
+
+        progress_var = tk.DoubleVar(value=0.0)
+        progress_text_var = tk.StringVar(value="进度：未开始")
+        progress_frame = ttk.LabelFrame(win, text="导出进度")
+        progress_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Progressbar(progress_frame, maximum=100, variable=progress_var).pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(progress_frame, textvariable=progress_text_var, justify="left", anchor="w").pack(fill="x", padx=8, pady=(0, 8))
+
+        btns2 = ttk.Frame(win)
+        btns2.pack(fill="x", padx=12, pady=(0, 12))
+
+        def start_export() -> None:
+            out_text = out_var.get().strip()
+            if not out_text:
+                messagebox.showinfo("提示", "请选择输出目录。", parent=win)
+                return
+            out_dir = Path(out_text).expanduser()
+            selected_keys = [key for key, var in check_vars.items() if var.get()]
+            selected_mode = mode_var.get()
+            selected_scope = scope_var.get()
+            try:
+                thread_count = int(thread_var.get() or DEFAULT_THREAD_COUNT)
+            except Exception:
+                thread_count = int(DEFAULT_THREAD_COUNT)
+
+            estimate = 1
+            if selected_mode == "product":
+                for key, _label, combo, _var in targets:
+                    if key in selected_keys:
+                        estimate *= max(1, len(self._target_values_from_combo(combo, real_only=True)))
+            else:
+                if "body" in selected_keys:
+                    estimate = max(1, len(self._target_values_from_combo(self.body_combo, real_only=True)))
+                else:
+                    estimate = max([len(self._target_values_from_combo(combo, real_only=True)) for key, _label, combo, _var in targets if key in selected_keys] or [1])
+            if selected_scope == "directory":
+                try:
+                    estimate = sum(
+                        self._estimate_lsf_scene_export(analyze_lsf_scene(parse_lsf_file(path)), selected_keys, selected_mode)
+                        for path in self.lsf_files
+                    )
+                except Exception:
+                    estimate = max(1, estimate) * max(1, len(self.lsf_files))
+            if estimate > 800 and not messagebox.askyesno("确认", f"预计会导出约 {estimate} 张 PNG，是否继续？", parent=win):
+                return
+
+            export_queue: queue.Queue = queue.Queue()
+            start_time = time.time()
+            progress_var.set(0.0)
+            progress_text_var.set(batch_progress_text(0, estimate, start_time))
+            start_button.state(["disabled"])
+            close_button.state(["disabled"])
+            win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            def progress_callback(done: int, total: int, warnings_count: int) -> None:
+                export_queue.put(("progress", done, total, warnings_count))
+
+            def worker() -> None:
+                try:
+                    exported, warnings_total = self._run_lsf_batch_export_threaded(
+                        out_dir,
+                        selected_keys,
+                        selected_mode,
+                        selected_scope,
+                        thread_count,
+                        progress_callback,
+                    )
+                    export_queue.put(("done", exported, warnings_total, time.time() - start_time))
+                except Exception as exc:
+                    export_queue.put(("error", str(exc)))
+
+            def poll_queue() -> None:
+                finished = None
+                try:
+                    while True:
+                        message = export_queue.get_nowait()
+                        kind = message[0]
+                        if kind == "progress":
+                            _kind, done, total, _warnings_count = message
+                            percent = 100.0 if total <= 0 else done * 100.0 / total
+                            progress_var.set(percent)
+                            progress_text_var.set(batch_progress_text(done, total, start_time))
+                        elif kind == "done":
+                            finished = message
+                            _kind, exported, _warnings_total, _elapsed = message
+                            progress_var.set(100.0)
+                            progress_text_var.set(batch_progress_text(exported, exported, start_time))
+                        elif kind == "error":
+                            finished = message
+                            progress_text_var.set(f"导出失败：{message[1]}")
+                except queue.Empty:
+                    pass
+
+                if finished is None:
+                    win.after(100, poll_queue)
+                    return
+
+                start_button.state(["!disabled"])
+                close_button.state(["!disabled"])
+                win.protocol("WM_DELETE_WINDOW", win.destroy)
+                if finished[0] == "done":
+                    _kind, exported, warnings_total, elapsed = finished
+                    messagebox.showinfo(
+                        "完成",
+                        f"已导出 {exported} 张 PNG。\n输出目录：{out_dir}\n警告数量：{warnings_total}\n用时：{format_duration(elapsed)}\n线程数量：{thread_count}",
+                        parent=win,
+                    )
+                else:
+                    messagebox.showerror("批量导出失败", finished[1], parent=win)
+
+            threading.Thread(target=worker, daemon=True).start()
+            poll_queue()
+
+        start_button = ttk.Button(btns2, text="开始导出", command=start_export)
+        start_button.pack(side="left")
+        close_button = ttk.Button(btns2, text="关闭", command=win.destroy)
+        close_button.pack(side="right")
+        self._place_popup_like_left_panel(win)
+
+
+class JSONTab(BaseTab):
+    def __init__(self, master: tk.Misc):
+        super().__init__(master, "JSON")
+        self.json_files: list[Path] = []
+        self.scene: Optional[JSONScene] = None
+        self.resolver: Optional[PNGResolver] = None
+        self.current_image: Optional[Image.Image] = None
+
+        self.json_input_var = tk.StringVar()
+        self.png_var = tk.StringVar()
+        self.scene_var = tk.StringVar()
+        self.body_var = tk.StringVar()
+        self.linkage_vars: dict[str, tk.BooleanVar] = {}
+        self.linkage_summary_var = tk.StringVar(value="联动：未开启")
+        self.expression_var = tk.StringVar()
+        self.blush_var = tk.StringVar()
+        self.stats_var = tk.StringVar(value="当前目录统计：JSON 0 个，PNG 0 个")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        input_box = ttk.LabelFrame(self.left, text="输入")
+        input_box.pack(fill="x", pady=(0, 8))
+        self._path_row(input_box, "JSON 目录", self.json_input_var, self._pick_json_dir, self._on_dir_changed)
+        self._path_row(input_box, "PNG 目录", self.png_var, self._pick_png, self._on_dir_changed)
+        self._compact_button_bar(input_box, [
+            ("加载 JSON 项目", self.load_project),
+            ("导出当前 PNG", self.export_current),
+            ("批量导出当前组合", self.open_batch_export_dialog),
+        ])
+
+        stats_box = ttk.LabelFrame(self.left, text="目录统计")
+        stats_box.pack(fill="x", pady=(0, 8))
+        ttk.Label(stats_box, textvariable=self.stats_var, justify="left", anchor="w").pack(fill="x", padx=8, pady=8)
+
+        linkage_box = ttk.LabelFrame(self.left, text="联动")
+        linkage_box.pack(fill="x", pady=(0, 8))
+        ttk.Button(linkage_box, text="联动设置", command=self.open_linkage_dialog).pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(linkage_box, textvariable=self.linkage_summary_var, justify="left", anchor="w").pack(fill="x", padx=8, pady=(0, 8))
+
+        options = ttk.LabelFrame(self.left, text="组合选项")
+        options.pack(fill="x")
+        ttk.Label(options, text="人物或者场景").pack(anchor="w", padx=8, pady=(8, 2))
+        self.scene_combo = ttk.Combobox(options, textvariable=self.scene_var, state="readonly", width=48)
+        self.scene_combo.pack(fill="x", padx=8)
+        self.scene_combo.bind("<<ComboboxSelected>>", lambda e: self._load_selected_scene())
+
+        ttk.Label(options, text="衣服或者其他时间端").pack(anchor="w", padx=8, pady=(8, 2))
+        self.body_combo = ttk.Combobox(options, textvariable=self.body_var, state="readonly", width=48)
+        self.body_combo.pack(fill="x", padx=8)
+        self.body_combo.bind("<<ComboboxSelected>>", lambda e: self._on_body_selected())
+
+        ttk.Label(options, text="表情").pack(anchor="w", padx=8, pady=(8, 2))
+        self.expression_combo = ttk.Combobox(options, textvariable=self.expression_var, state="readonly", width=48)
+        self.expression_combo.pack(fill="x", padx=8)
+        self.expression_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_preview())
+
+        ttk.Label(options, text="红晕").pack(anchor="w", padx=8, pady=(8, 2))
+        self.blush_combo = ttk.Combobox(options, textvariable=self.blush_var, state="readonly", width=48)
+        self.blush_combo.pack(fill="x", padx=8, pady=(0, 8))
+        self.blush_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_preview())
+
+        self.create_info_box()
+        self.create_preview_area()
+
+    def _label_is_none_choice(self, label: str) -> bool:
+        return label.startswith("(") or label.startswith("原图")
+
+    def _advance_combobox(self, combo: ttk.Combobox, var: tk.StringVar, *, skip_none_choices: bool = False) -> bool:
+        values = list(combo["values"] or [])
+        if not values or str(combo.cget("state")) == "disabled":
+            return False
+
+        current = var.get()
+        try:
+            current_idx = values.index(current)
+        except ValueError:
+            current_idx = -1
+
+        usable_indices = list(range(len(values)))
+        if skip_none_choices and len(values) > 1:
+            real_indices = [i for i, label in enumerate(values) if not self._label_is_none_choice(str(label))]
+            if real_indices:
+                usable_indices = real_indices
+
+        if current_idx in usable_indices:
+            pos = usable_indices.index(current_idx)
+            next_idx = usable_indices[(pos + 1) % len(usable_indices)]
+        else:
+            next_idx = next((i for i in usable_indices if i > current_idx), usable_indices[0])
+
+        var.set(values[next_idx])
+        return True
+
+    def _get_linkage_var(self, key: str) -> tk.BooleanVar:
+        if key not in self.linkage_vars:
+            self.linkage_vars[key] = tk.BooleanVar(value=False)
+        return self.linkage_vars[key]
+
+    def _iter_link_targets(self):
+        yield "expression", "表情", self.expression_combo, self.expression_var
+        yield "blush", "红晕", self.blush_combo, self.blush_var
+
+    def _combo_has_real_options(self, combo: ttk.Combobox) -> bool:
+        values = list(combo["values"] or [])
+        if str(combo.cget("state")) == "disabled":
+            return False
+        return any(not self._label_is_none_choice(str(v)) for v in values)
+
+    def _update_linkage_summary(self) -> None:
+        selected = []
+        for key, label, combo, _var in self._iter_link_targets():
+            if self._get_linkage_var(key).get() and self._combo_has_real_options(combo):
+                selected.append(label)
+        if selected:
+            self.linkage_summary_var.set("联动：" + "、".join(selected))
+        else:
+            self.linkage_summary_var.set("联动：未开启")
+
+    def open_linkage_dialog(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("联动设置")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        win.resizable(False, False)
+
+        ttk.Label(
+            win,
+            text="勾选后：手动切换“衣服或者其他时间端”时，下面这些选项会各自切到下一项。",
+            wraplength=360,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(12, 8))
+
+        frame = ttk.LabelFrame(win, text="可联动项目")
+        frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        for key, label, combo, _var in self._iter_link_targets():
+            bool_var = self._get_linkage_var(key)
+            available = self._combo_has_real_options(combo)
+            text = label if available else f"{label}（当前无可用选项）"
+            cb = ttk.Checkbutton(frame, text=text, variable=bool_var, command=self._update_linkage_summary)
+            cb.pack(anchor="w", padx=8, pady=3)
+            if not available:
+                cb.state(["disabled"])
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+
+        def select_all_available() -> None:
+            for key, _label, combo, _var in self._iter_link_targets():
+                if self._combo_has_real_options(combo):
+                    self._get_linkage_var(key).set(True)
+            self._update_linkage_summary()
+
+        def clear_all() -> None:
+            for key, _label, _combo, _var in self._iter_link_targets():
+                self._get_linkage_var(key).set(False)
+            self._update_linkage_summary()
+
+        ttk.Button(btns, text="全选可用", command=select_all_available).pack(side="left")
+        ttk.Button(btns, text="清空", command=clear_all).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
+        self._place_popup_like_left_panel(win)
+
+    def _on_body_selected(self) -> None:
+        for key, _label, combo, var in self._iter_link_targets():
+            if self._get_linkage_var(key).get() and self._combo_has_real_options(combo):
+                self._advance_combobox(combo, var, skip_none_choices=True)
+        self.refresh_preview()
+
+    def _pick_json_dir(self) -> None:
+        folder = filedialog.askdirectory()
+        if folder:
+            self.json_input_var.set(folder)
+            self.png_var.set(folder)
+
+    def _pick_png(self) -> None:
+        folder = filedialog.askdirectory()
+        if folder:
+            self.png_var.set(folder)
+
+    def _on_dir_changed(self) -> None:
+        json_count = count_dir_files(self.json_input_var.get(), ("*.json",))
+        png_count = count_dir_files(self.png_var.get(), ("*.png",))
+        self.stats_var.set(f"当前目录统计：JSON {json_count} 个，PNG {png_count} 个")
+
+    def load_project(self) -> None:
+        try:
+            self.json_files = collect_input_files(self.json_input_var.get(), ("*.json",))
+            if not self.json_files:
+                raise ProjectError("请先选择包含 JSON 的目录。")
+            if not self.png_var.get().strip():
+                self.png_var.set(self.json_input_var.get().strip())
+            if not self.png_var.get().strip():
+                raise ProjectError("请先选择 PNG 目录。")
+            self.resolver = PNGResolver(self.png_var.get().strip())
+            self._on_dir_changed()
+            scene_names = [p.name for p in self.json_files]
+            self.scene_combo["values"] = scene_names
+            self.scene_var.set(scene_names[0])
+            self._load_selected_scene()
+        except Exception as exc:
+            messagebox.showerror("加载失败", str(exc))
+
+    def _load_selected_scene(self) -> None:
+        try:
+            selected = self.scene_var.get().strip()
+            if not selected:
+                return
+            path = next((p for p in self.json_files if p.name == selected), None)
+            if not path:
+                return
+            self.scene = analyze_json_scene(parse_json_project(path))
+            self.body_combo["values"] = [x.label for x in self.scene.body_options]
+            self.expression_combo["values"] = [x.label for x in self.scene.expression_options]
+            self.blush_combo["values"] = [x.label for x in self.scene.blush_options]
+            if len(self.scene.body_options) > 1 and self.scene.body_options[0].key == "__none__":
+                self.body_var.set(self.scene.body_options[1].label)
+            else:
+                self.body_var.set(self.scene.body_options[0].label if self.scene.body_options else "")
+            if len(self.scene.expression_options) > 1:
+                self.expression_var.set(self.scene.expression_options[1].label)
+            else:
+                self.expression_var.set(self.scene.expression_options[0].label if self.scene.expression_options else "")
+            self.blush_var.set(self.scene.blush_options[0].label if self.scene.blush_options else "")
+            self._update_linkage_summary()
+            self.refresh_preview()
+        except Exception as exc:
+            messagebox.showerror("读取 JSON 失败", str(exc))
+
+    def _find_option(self, options: list[LSFOption], selected_label: str) -> Optional[LSFOption]:
+        for item in options:
+            if item.label == selected_label:
+                return item
+        return options[0] if options else None
+
+    def refresh_preview(self) -> None:
+        if not self.scene or not self.resolver:
+            return
+        body = self._find_option(self.scene.body_options, self.body_var.get())
+        expr = self._find_option(self.scene.expression_options, self.expression_var.get())
+        blush = self._find_option(self.scene.blush_options, self.blush_var.get())
+        image, warnings, layers = compose_json_scene(
+            self.scene,
+            self.resolver,
+            body if body and body.records is not None else None,
+            None if expr and expr.key == "__none__" else expr,
+            None if blush and blush.key == "__none__" else blush,
+        )
+        self.current_image = image
+        self.preview.show_image(image)
+        lines = [
+            f"JSON: {self.scene.project.json_path.name}",
+            f"画布: {self.scene.project.canvas_width} x {self.scene.project.canvas_height}",
+            f"已加载 JSON 数: {len(self.json_files)}",
+            f"已索引 PNG 数: {len(self.resolver.by_stem) if self.resolver else 0}",
+            f"衣服或者其他: {body.label if body else '(无)'}",
+            f"表情: {expr.label if expr else '(无表情)'}",
+            f"红晕: {blush.label if blush else '(无红晕)'}",
+            f"当前合成图层数: {len(layers)}",
+            "",
+            "分析结果:",
+            *[f"  - {n}" for n in self.scene.notes],
+        ]
+        if warnings:
+            lines += ["", "警告:", *[f"  - {w}" for w in warnings]]
+        self._set_info(lines)
+
+    def export_current(self) -> None:
+        if self.current_image is None:
+            messagebox.showinfo("提示", "没有可导出的预览图。")
+            return
+        out = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
+        if out:
+            self.current_image.save(out)
+            messagebox.showinfo("完成", f"已导出: {out}")
+
+
+    def _target_values_from_combo(self, combo: ttk.Combobox, *, real_only: bool = True) -> list[str]:
+        values = [str(v) for v in list(combo["values"] or [])]
+        if real_only:
+            real = [v for v in values if not self._label_is_none_choice(v)]
+            return real if real else values
+        return values
+
+    def _advance_label_value(self, values: list[str], current: str, *, skip_none_choices: bool = True) -> str:
+        if not values:
+            return current
+        usable = values
+        if skip_none_choices and len(values) > 1:
+            real = [v for v in values if not self._label_is_none_choice(v)]
+            if real:
+                usable = real
+        try:
+            current_idx = values.index(current)
+        except ValueError:
+            current_idx = -1
+        usable_indices = [values.index(v) for v in usable if v in values]
+        if not usable_indices:
+            return current
+        if current_idx in usable_indices:
+            pos = usable_indices.index(current_idx)
+            return values[usable_indices[(pos + 1) % len(usable_indices)]]
+        next_idx = next((i for i in usable_indices if i > current_idx), usable_indices[0])
+        return values[next_idx]
+
+    def _iter_batch_targets(self):
+        yield "body", "衣服或者其他时间端", self.body_combo, self.body_var
+        yield from self._iter_link_targets()
+
+    def _current_json_selection(self) -> dict[str, str]:
+        return {
+            "body": self.body_var.get(),
+            "expression": self.expression_var.get(),
+            "blush": self.blush_var.get(),
+        }
+
+    def _compose_json_selection(self, selection: dict[str, str]) -> tuple[Image.Image, list[str], list]:
+        if not self.scene or not self.resolver:
+            raise ProjectError("请先加载 JSON 项目。")
+        body = self._find_option(self.scene.body_options, selection.get("body", self.body_var.get()))
+        expr = self._find_option(self.scene.expression_options, selection.get("expression", self.expression_var.get()))
+        blush = self._find_option(self.scene.blush_options, selection.get("blush", self.blush_var.get()))
+        return compose_json_scene(
+            self.scene,
+            self.resolver,
+            body if body and body.records is not None else None,
+            None if expr and expr.key == "__none__" else expr,
+            None if blush and blush.key == "__none__" else blush,
+        )
+
+    def _selection_filename(self, index: int, selection: dict[str, str], selected_keys: list[str]) -> str:
+        scene_stem = self.scene.project.stem if self.scene else "scene"
+        parts = [safe_filename_part(scene_stem, 40), f"{index:04d}"]
+        for key, label, _combo, _var in self._iter_batch_targets():
+            if key in selected_keys:
+                parts.append(safe_filename_part(selection.get(key, ""), 32))
+        return "__".join([p for p in parts if p])
+
+    def _values_from_labels(self, values: list[str], *, real_only: bool = True) -> list[str]:
+        values = [str(v) for v in values]
+        if real_only:
+            real = [v for v in values if not self._label_is_none_choice(v)]
+            return real if real else values
+        return values
+
+    def _json_targets_for_scene(self, scene: JSONScene) -> list[tuple[str, str, list[str]]]:
+        return [
+            ("body", "衣服或者其他时间端", [x.label for x in scene.body_options]),
+            ("expression", "表情", [x.label for x in scene.expression_options]),
+            ("blush", "红晕", [x.label for x in scene.blush_options]),
+        ]
+
+    def _default_json_selection_for_scene(self, scene: JSONScene) -> dict[str, str]:
+        selection: dict[str, str] = {}
+        if scene.body_options:
+            if len(scene.body_options) > 1 and scene.body_options[0].key == "__none__":
+                selection["body"] = scene.body_options[1].label
+            else:
+                selection["body"] = scene.body_options[0].label
+        if scene.expression_options:
+            selection["expression"] = scene.expression_options[1].label if len(scene.expression_options) > 1 else scene.expression_options[0].label
+        if scene.blush_options:
+            selection["blush"] = scene.blush_options[0].label
+        return selection
+
+    def _compose_json_selection_for_scene(self, scene: JSONScene, selection: dict[str, str]) -> tuple[Image.Image, list[str], list]:
+        if not self.resolver:
+            raise ProjectError("请先加载 PNG 目录。")
+        body = self._find_option(scene.body_options, selection.get("body", ""))
+        expr = self._find_option(scene.expression_options, selection.get("expression", ""))
+        blush = self._find_option(scene.blush_options, selection.get("blush", ""))
+        return compose_json_scene(
+            scene,
+            self.resolver,
+            body if body and body.records is not None else None,
+            None if expr and expr.key == "__none__" else expr,
+            None if blush and blush.key == "__none__" else blush,
+        )
+
+    def _selection_filename_for_json_scene(self, scene: JSONScene, index: int, selection: dict[str, str], selected_keys: list[str]) -> str:
+        parts = [safe_filename_part(scene.project.stem, 40), f"{index:04d}"]
+        for key, _label, _values in self._json_targets_for_scene(scene):
+            if key in selected_keys:
+                parts.append(safe_filename_part(selection.get(key, ""), 32))
+        return "__".join([p for p in parts if p])
+
+    def _estimate_json_scene_export(self, scene: JSONScene, selected_keys: list[str], mode: str) -> int:
+        targets = self._json_targets_for_scene(scene)
+        valid_keys = [k for k in selected_keys if any(t[0] == k for t in targets)]
+        if mode == "product":
+            estimate = 1
+            any_selected = False
+            for key, _label, values in targets:
+                if key in valid_keys:
+                    any_selected = True
+                    estimate *= max(1, len(self._values_from_labels(values, real_only=True)))
+            return estimate if any_selected else 1
+        if "body" in valid_keys:
+            body_values = next((values for key, _label, values in targets if key == "body"), [])
+            return max(1, len(self._values_from_labels(body_values, real_only=True)))
+        counts = [len(self._values_from_labels(values, real_only=True)) for key, _label, values in targets if key in valid_keys]
+        return max(counts or [1])
+
+    def _iter_json_scene_export_jobs(self, scene: JSONScene, selected_keys: list[str], mode: str, current: Optional[dict[str, str]] = None):
+        current = dict(current or self._default_json_selection_for_scene(scene))
+        targets = self._json_targets_for_scene(scene)
+        valid_selected_keys = [k for k in selected_keys if any(t[0] == k for t in targets)]
+        filename_keys = valid_selected_keys or ["body"]
+
+        if mode == "product":
+            value_lists: list[tuple[str, list[str]]] = []
+            for key, _label, values in targets:
+                if key in valid_selected_keys:
+                    vals = self._values_from_labels(values, real_only=True)
+                    if vals:
+                        value_lists.append((key, vals))
+            combos = itertools.product(*[vals for _key, vals in value_lists]) if value_lists else [()]
+            for idx, values in enumerate(combos, start=1):
+                selection = dict(current)
+                for (key, _vals), value in zip(value_lists, values):
+                    selection[key] = value
+                yield idx, scene, selection, filename_keys
+        else:
+            count = self._estimate_json_scene_export(scene, valid_selected_keys, mode)
+            selection = dict(current)
+            for idx in range(1, count + 1):
+                yield idx, scene, dict(selection), filename_keys
+                if idx < count:
+                    for key, _label, values in targets:
+                        if key in valid_selected_keys:
+                            selection[key] = self._advance_label_value(values, selection.get(key, ""), skip_none_choices=True)
+
+    def _collect_json_batch_jobs(self, selected_keys: list[str], mode: str, scope: str):
+        if not self.scene or not self.resolver:
+            raise ProjectError("请先加载 JSON 项目。")
+        if scope == "directory":
+            jobs = []
+            for path in self.json_files:
+                scene = analyze_json_scene(parse_json_project(path))
+                jobs.extend(self._iter_json_scene_export_jobs(scene, selected_keys, mode))
+            return jobs
+        return list(self._iter_json_scene_export_jobs(self.scene, selected_keys, mode, self._current_json_selection()))
+
+    def _export_json_batch_job(self, out_dir: Path, job, filename_lock: threading.Lock, reserved_paths: set[str]) -> int:
+        idx, scene, selection, filename_keys = job
+        img, warnings, _layers = self._compose_json_selection_for_scene(scene, selection)
+        filename = self._selection_filename_for_json_scene(scene, idx, selection, filename_keys)
+        with filename_lock:
+            out_path = make_unique_png_path_reserved(out_dir, filename, reserved_paths)
+        img.save(out_path)
+        return len(warnings)
+
+    def _run_json_batch_export_threaded(
+        self,
+        out_dir: Path,
+        selected_keys: list[str],
+        mode: str,
+        scope: str = "current",
+        thread_count: int = 4,
+        progress_callback=None,
+    ) -> tuple[int, int]:
+        if not self.scene or not self.resolver:
+            raise ProjectError("请先加载 JSON 项目。")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        jobs = self._collect_json_batch_jobs(selected_keys, mode, scope)
+        total = len(jobs)
+        if progress_callback:
+            progress_callback(0, total, 0)
+        if not jobs:
+            return 0, 0
+
+        max_workers = max(1, min(int(thread_count or 4), 16))
+        filename_lock = threading.Lock()
+        reserved_paths: set[str] = set()
+        completed = 0
+        warnings_total = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(self._export_json_batch_job, out_dir, job, filename_lock, reserved_paths)
+                for job in jobs
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    warnings_total += future.result()
+                except Exception:
+                    for f in futures:
+                        f.cancel()
+                    raise
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, total, warnings_total)
+        return completed, warnings_total
+
+    def _run_json_batch_export_for_scene(self, scene: JSONScene, out_dir: Path, selected_keys: list[str], mode: str, current: Optional[dict[str, str]] = None) -> tuple[int, int]:
+        current = dict(current or self._default_json_selection_for_scene(scene))
+        targets = self._json_targets_for_scene(scene)
+        selected_keys = [k for k in selected_keys if any(t[0] == k for t in targets)]
+        warnings_total = 0
+        exported = 0
+
+        if mode == "product":
+            value_lists: list[tuple[str, list[str]]] = []
+            for key, _label, values in targets:
+                if key in selected_keys:
+                    vals = self._values_from_labels(values, real_only=True)
+                    if vals:
+                        value_lists.append((key, vals))
+            combos = itertools.product(*[vals for _key, vals in value_lists]) if value_lists else [()]
+            for idx, values in enumerate(combos, start=1):
+                selection = dict(current)
+                for (key, _vals), value in zip(value_lists, values):
+                    selection[key] = value
+                img, warnings, _layers = self._compose_json_selection_for_scene(scene, selection)
+                warnings_total += len(warnings)
+                filename = self._selection_filename_for_json_scene(scene, idx, selection, selected_keys or ["body"])
+                img.save(make_unique_png_path(out_dir, filename))
+                exported += 1
+        else:
+            count = self._estimate_json_scene_export(scene, selected_keys, mode)
+            selection = dict(current)
+            for idx in range(1, count + 1):
+                img, warnings, _layers = self._compose_json_selection_for_scene(scene, selection)
+                warnings_total += len(warnings)
+                filename = self._selection_filename_for_json_scene(scene, idx, selection, selected_keys or ["body"])
+                img.save(make_unique_png_path(out_dir, filename))
+                exported += 1
+                if idx < count:
+                    for key, _label, values in targets:
+                        if key in selected_keys:
+                            selection[key] = self._advance_label_value(values, selection.get(key, ""), skip_none_choices=True)
+        return exported, warnings_total
+
+    def _run_json_batch_export(self, out_dir: Path, selected_keys: list[str], mode: str, scope: str = "current") -> tuple[int, int]:
+        if not self.scene or not self.resolver:
+            raise ProjectError("请先加载 JSON 项目。")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if scope == "directory":
+            exported = 0
+            warnings_total = 0
+            for path in self.json_files:
+                scene = analyze_json_scene(parse_json_project(path))
+                e, w = self._run_json_batch_export_for_scene(scene, out_dir, selected_keys, mode)
+                exported += e
+                warnings_total += w
+            return exported, warnings_total
+        return self._run_json_batch_export_for_scene(self.scene, out_dir, selected_keys, mode, self._current_json_selection())
+
+    def open_batch_export_dialog(self) -> None:
+        if not self.scene or not self.resolver:
+            messagebox.showinfo("提示", "请先加载 JSON 项目。")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("批量导出当前组合")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        win.resizable(False, False)
+
+        default_folder = Path(self.png_var.get().strip() or ".").expanduser() / "batch_export"
+        out_var = tk.StringVar(value=str(default_folder))
+        mode_var = tk.StringVar(value="sequence")
+        scope_var = tk.StringVar(value="current")
+        thread_var = tk.StringVar(value=DEFAULT_THREAD_COUNT)
+        check_vars: dict[str, tk.BooleanVar] = {}
+
+        ttk.Label(
+            win,
+            text="选择哪些下拉项参与批量导出。默认按当前“联动设置”勾选；也可以手动改。",
+            wraplength=420,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(12, 8))
+
+        out_frame = ttk.LabelFrame(win, text="输出目录")
+        out_frame.pack(fill="x", padx=12, pady=(0, 8))
+        row = ttk.Frame(out_frame)
+        row.pack(fill="x", padx=8, pady=8)
+        ttk.Entry(row, textvariable=out_var, width=44).pack(side="left", fill="x", expand=True)
+
+        def choose_out_dir() -> None:
+            folder = filedialog.askdirectory(parent=win)
+            if folder:
+                out_var.set(folder)
+
+        def use_loaded_dir() -> None:
+            folder = self.json_input_var.get().strip() or self.png_var.get().strip()
+            if folder:
+                out_var.set(folder)
+
+        ttk.Button(row, text="选择", command=choose_out_dir, width=8).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="当前目录", command=use_loaded_dir, width=10).pack(side="left", padx=(6, 0))
+
+        mode_frame = ttk.LabelFrame(win, text="导出方式")
+        mode_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Radiobutton(mode_frame, text="联动序列：以当前选择为起点，逐项切换时间端；勾选项跟着下一项", variable=mode_var, value="sequence").pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Radiobutton(mode_frame, text="全组合：把勾选项的所有真实选项全部排列组合导出", variable=mode_var, value="product").pack(anchor="w", padx=8, pady=(2, 6))
+
+        scope_frame = ttk.LabelFrame(win, text="导出范围")
+        scope_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Radiobutton(scope_frame, text="只导出当前选中的 JSON", variable=scope_var, value="current").pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Radiobutton(scope_frame, text="导出当前加载目录里的全部 JSON", variable=scope_var, value="directory").pack(anchor="w", padx=8, pady=(2, 6))
+
+        thread_frame = ttk.LabelFrame(win, text="多线程")
+        thread_frame.pack(fill="x", padx=12, pady=(0, 8))
+        thread_row = ttk.Frame(thread_frame)
+        thread_row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(thread_row, text="导出线程数量").pack(side="left")
+        thread_combo = ttk.Combobox(
+            thread_row,
+            textvariable=thread_var,
+            values=THREAD_COUNT_CHOICES,
+            state="readonly",
+            width=6,
+        )
+        thread_combo.pack(side="left", padx=(8, 8))
+        ttk.Label(thread_row, text="默认 4；可选 2 / 4 / 6 / 8 / 12 / 16").pack(side="left")
+
+        target_frame = ttk.LabelFrame(win, text="参与批量的选项")
+        target_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        targets = list(self._iter_batch_targets())
+        for key, label, combo, _var in targets:
+            available = self._combo_has_real_options(combo)
+            default_checked = key == "body" or (key in self.linkage_vars and self._get_linkage_var(key).get())
+            var = tk.BooleanVar(value=bool(default_checked and available))
+            check_vars[key] = var
+            text = label if available else f"{label}（当前无可用选项）"
+            cb = ttk.Checkbutton(target_frame, text=text, variable=var)
+            cb.pack(anchor="w", padx=8, pady=2)
+            if not available:
+                cb.state(["disabled"])
+
+        btns1 = ttk.Frame(win)
+        btns1.pack(fill="x", padx=12, pady=(0, 8))
+
+        def apply_linkage_setting() -> None:
+            for key, _label, combo, _var in targets:
+                if not self._combo_has_real_options(combo):
+                    check_vars[key].set(False)
+                elif key == "body":
+                    check_vars[key].set(True)
+                else:
+                    check_vars[key].set(self._get_linkage_var(key).get())
+
+        def select_all_available() -> None:
+            for key, _label, combo, _var in targets:
+                check_vars[key].set(self._combo_has_real_options(combo))
+
+        def clear_all() -> None:
+            for key in check_vars:
+                check_vars[key].set(False)
+
+        ttk.Button(btns1, text="按联动设置选择", command=apply_linkage_setting).pack(side="left")
+        ttk.Button(btns1, text="全选可用", command=select_all_available).pack(side="left", padx=(8, 0))
+        ttk.Button(btns1, text="清空", command=clear_all).pack(side="left", padx=(8, 0))
+
+        progress_var = tk.DoubleVar(value=0.0)
+        progress_text_var = tk.StringVar(value="进度：未开始")
+        progress_frame = ttk.LabelFrame(win, text="导出进度")
+        progress_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Progressbar(progress_frame, maximum=100, variable=progress_var).pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(progress_frame, textvariable=progress_text_var, justify="left", anchor="w").pack(fill="x", padx=8, pady=(0, 8))
+
+        btns2 = ttk.Frame(win)
+        btns2.pack(fill="x", padx=12, pady=(0, 12))
+
+        def start_export() -> None:
+            out_text = out_var.get().strip()
+            if not out_text:
+                messagebox.showinfo("提示", "请选择输出目录。", parent=win)
+                return
+            out_dir = Path(out_text).expanduser()
+            selected_keys = [key for key, var in check_vars.items() if var.get()]
+            selected_mode = mode_var.get()
+            selected_scope = scope_var.get()
+            try:
+                thread_count = int(thread_var.get() or DEFAULT_THREAD_COUNT)
+            except Exception:
+                thread_count = int(DEFAULT_THREAD_COUNT)
+
+            estimate = 1
+            if selected_mode == "product":
+                for key, _label, combo, _var in targets:
+                    if key in selected_keys:
+                        estimate *= max(1, len(self._target_values_from_combo(combo, real_only=True)))
+            else:
+                if "body" in selected_keys:
+                    estimate = max(1, len(self._target_values_from_combo(self.body_combo, real_only=True)))
+                else:
+                    estimate = max([len(self._target_values_from_combo(combo, real_only=True)) for key, _label, combo, _var in targets if key in selected_keys] or [1])
+            if selected_scope == "directory":
+                try:
+                    estimate = sum(
+                        self._estimate_json_scene_export(analyze_json_scene(parse_json_project(path)), selected_keys, selected_mode)
+                        for path in self.json_files
+                    )
+                except Exception:
+                    estimate = max(1, estimate) * max(1, len(self.json_files))
+            if estimate > 800 and not messagebox.askyesno("确认", f"预计会导出约 {estimate} 张 PNG，是否继续？", parent=win):
+                return
+
+            export_queue: queue.Queue = queue.Queue()
+            start_time = time.time()
+            progress_var.set(0.0)
+            progress_text_var.set(batch_progress_text(0, estimate, start_time))
+            start_button.state(["disabled"])
+            close_button.state(["disabled"])
+            win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            def progress_callback(done: int, total: int, warnings_count: int) -> None:
+                export_queue.put(("progress", done, total, warnings_count))
+
+            def worker() -> None:
+                try:
+                    exported, warnings_total = self._run_json_batch_export_threaded(
+                        out_dir,
+                        selected_keys,
+                        selected_mode,
+                        selected_scope,
+                        thread_count,
+                        progress_callback,
+                    )
+                    export_queue.put(("done", exported, warnings_total, time.time() - start_time))
+                except Exception as exc:
+                    export_queue.put(("error", str(exc)))
+
+            def poll_queue() -> None:
+                finished = None
+                try:
+                    while True:
+                        message = export_queue.get_nowait()
+                        kind = message[0]
+                        if kind == "progress":
+                            _kind, done, total, _warnings_count = message
+                            percent = 100.0 if total <= 0 else done * 100.0 / total
+                            progress_var.set(percent)
+                            progress_text_var.set(batch_progress_text(done, total, start_time))
+                        elif kind == "done":
+                            finished = message
+                            _kind, exported, _warnings_total, _elapsed = message
+                            progress_var.set(100.0)
+                            progress_text_var.set(batch_progress_text(exported, exported, start_time))
+                        elif kind == "error":
+                            finished = message
+                            progress_text_var.set(f"导出失败：{message[1]}")
+                except queue.Empty:
+                    pass
+
+                if finished is None:
+                    win.after(100, poll_queue)
+                    return
+
+                start_button.state(["!disabled"])
+                close_button.state(["!disabled"])
+                win.protocol("WM_DELETE_WINDOW", win.destroy)
+                if finished[0] == "done":
+                    _kind, exported, warnings_total, elapsed = finished
+                    messagebox.showinfo(
+                        "完成",
+                        f"已导出 {exported} 张 PNG。\n输出目录：{out_dir}\n警告数量：{warnings_total}\n用时：{format_duration(elapsed)}\n线程数量：{thread_count}",
+                        parent=win,
+                    )
+                else:
+                    messagebox.showerror("批量导出失败", finished[1], parent=win)
+
+            threading.Thread(target=worker, daemon=True).start()
+            poll_queue()
+
+        start_button = ttk.Button(btns2, text="开始导出", command=start_export)
+        start_button.pack(side="left")
+        close_button = ttk.Button(btns2, text="关闭", command=win.destroy)
+        close_button.pack(side="right")
+        self._place_popup_like_left_panel(win)
+
+
+def center_main_window(root: tk.Tk, width: int = 1435, height: int = 936) -> None:
+    """根据使用者当前屏幕分辨率，将主窗口自动居中。"""
+
+    def apply() -> None:
+        root.update_idletasks()
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 2)
+        root.geometry(f"{width}x{height}+{x}+{y}")
+
+    apply()
+    # Windows 下窗口创建后可能被系统再次摆放，延迟校准一次，确保启动时居中。
+    root.after(50, apply)
+
+
+class App(ttk.Frame):
+    def __init__(self, master: tk.Tk):
+        super().__init__(master)
+        master.title(TITLE)
+        apply_window_icon(master)
+        center_main_window(master, 1435, 936)
+        self.pack(fill="both", expand=True)
+        # 只保留主功能界面，不再显示顶部功能标签。
+        LSFTab(self).pack(fill="both", expand=True)
+
+
+def run_app() -> None:
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
