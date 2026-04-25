@@ -73,7 +73,7 @@ dist/HaisonShoujoViewerExtractor/
 其中主程序为：
 
 ```text
-HaisouShoujoViewerExtractor.exe
+HaisonuShoujoViewerExtractor.exe
 ```
 
 ### 方法二：GitHub Actions 自动打包
